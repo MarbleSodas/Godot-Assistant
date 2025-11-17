@@ -173,6 +173,51 @@ async def test_plan_streaming():
             return False
 
 
+async def test_mcp_integration():
+    """Test MCP tools integration."""
+    print("=" * 60)
+    print("Testing MCP Tools Integration")
+    print("=" * 60)
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get("http://localhost:8000/api/agent/config")
+            response.raise_for_status()
+            data = response.json()
+
+            tools = data['config']['tools']
+
+            # Check for MCP tools
+            mcp_tools = [t for t in tools if 'mcp__' in t]
+
+            if mcp_tools:
+                print(f"MCP Integration: ENABLED")
+                print(f"MCP Tools Found: {len(mcp_tools)}")
+
+                # Check for specific MCP tools
+                has_sequential = any('sequential' in t.lower() for t in mcp_tools)
+                has_context7 = any('context7' in t.lower() for t in mcp_tools)
+
+                print(f"  - Sequential Thinking: {'✓' if has_sequential else '✗'}")
+                print(f"  - Context7: {'✓' if has_context7 else '✗'}")
+
+                print("\nMCP Tools:")
+                for tool in mcp_tools:
+                    print(f"  - {tool}")
+
+                print("✓ MCP integration verified\n")
+            else:
+                print("MCP Integration: DISABLED or not available")
+                print("Note: This is expected if MCP servers are not installed")
+                print("✓ Test passed (MCP optional)\n")
+
+            return True
+
+        except Exception as e:
+            print(f"✗ MCP integration test failed: {e}\n")
+            return False
+
+
 async def test_reset():
     """Test conversation reset."""
     print("=" * 60)
@@ -221,6 +266,7 @@ async def main():
 
     results.append(("Health Check", await test_health()))
     results.append(("Configuration", await test_config()))
+    results.append(("MCP Integration", await test_mcp_integration()))
     results.append(("Simple Plan", await test_plan_simple()))
     results.append(("Streaming Plan", await test_plan_streaming()))
     results.append(("Reset", await test_reset()))

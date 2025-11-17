@@ -1,239 +1,519 @@
 """
 File system tools for the planning agent.
 
-Provides tools for reading files, listing directories, and searching codebase.
+This module provides comprehensive file system manipulation tools including:
+- File reading with proper error handling and encoding support
+- Directory listing with pattern filtering and organized output
+- Codebase searching with regex support and result limiting
+- Path validation and security checks
+
+All tools use consistent error handling patterns and return standardized responses.
 """
 
+import logging
 import os
 import re
 from pathlib import Path
-from typing import List, Dict
+from typing import Optional
+
 import aiofiles
 
 from strands import tool
 
+from ..types.tool_types import (
+    ToolResponse,
+    FilePath,
+    DirectoryName,
+    SearchPattern,
+    FilePattern,
+    MaxResults,
+    DirectoryListing
+)
+from ..utils.error_handlers import (
+    handle_file_errors,
+    validate_path,
+    create_success_response,
+    create_error_response
+)
+
+# Configure module logger
+logger = logging.getLogger(__name__)
+
 
 @tool
-async def read_file(file_path: str) -> Dict[str, any]:
+@handle_file_errors("file reading")
+async def read_file(file_path: FilePath) -> ToolResponse:
     """
-    Read the contents of a file.
+    Read the contents of a file with comprehensive error handling and encoding support.
+
+    This tool safely reads file contents while handling various edge cases including:
+    - File not found errors
+    - Permission issues
+    - Encoding problems
+    - Binary files (with appropriate handling)
 
     Args:
-        file_path: Path to the file to read (relative or absolute)
+        file_path: Path to the file to read (relative or absolute).
+                  Supports both relative and absolute paths.
 
     Returns:
-        Dictionary with status and file content or error message
+        ToolResponse: Standardized response containing either:
+            - Success: File content formatted with path information
+            - Error: Detailed error message with error categorization
+
+    Example:
+        >>> result = await read_file("src/main.py")
+        >>> print(result["status"])  # "success" or "error"
+        >>> print(result["content"][0]["text"])  # File content or error message
+
+    Note:
+        - Files are read with UTF-8 encoding, falling back to 'ignore' for invalid characters
+        - Large files are handled efficiently with async I/O
+        - Binary files are read but may contain unreadable characters
     """
     try:
-        # Resolve path
-        path = Path(file_path).resolve()
+        # Validate and resolve path with security checks
+        path = validate_path(
+            file_path,
+            operation_name="file reading",
+            must_exist=True,
+            must_be_file=True
+        )
 
-        # Check if file exists
-        if not path.exists():
-            return {
-                "status": "error",
-                "content": [{"text": f"File not found: {file_path}"}]
+        # Read file content asynchronously with proper encoding handling
+        async with aiofiles.open(
+            path,
+            mode='r',
+            encoding='utf-8',
+            errors='ignore'  # Handle invalid characters gracefully
+        ) as file:
+            content = await file.read()
+
+        # Format response with path information for context
+        formatted_content = f"📄 File: {file_path}\n\n{content}"
+
+        logger.info(f"Successfully read file: {file_path} ({len(content)} characters)")
+
+        return create_success_response(
+            formatted_content,
+            metadata={
+                "file_path": str(path),
+                "file_size": len(content),
+                "encoding": "utf-8"
             }
+        )
 
-        # Check if it's a file (not a directory)
-        if not path.is_file():
-            return {
-                "status": "error",
-                "content": [{"text": f"Path is not a file: {file_path}"}]
-            }
-
-        # Read file content
-        async with aiofiles.open(path, mode='r', encoding='utf-8', errors='ignore') as f:
-            content = await f.read()
-
-        return {
-            "status": "success",
-            "content": [{
-                "text": f"File: {file_path}\n\n{content}"
-            }]
-        }
-
-    except PermissionError:
-        return {
-            "status": "error",
-            "content": [{"text": f"Permission denied: {file_path}"}]
-        }
     except Exception as e:
-        return {
-            "status": "error",
-            "content": [{"text": f"Error reading file: {str(e)}"}]
-        }
+        # This should not happen due to the decorator, but added as safety net
+        logger.error(f"Unexpected error reading file {file_path}: {e}")
+        return create_error_response(
+            f"Unexpected error reading file: {str(e)}",
+            "FileReadUnexpectedError"
+        )
 
 
 @tool
-async def list_files(directory: str = ".", pattern: str = "*") -> Dict[str, any]:
+@handle_file_errors("directory listing")
+async def list_files(
+    directory: DirectoryName = ".",
+    pattern: str = "*"
+) -> ToolResponse:
     """
-    List files and directories in a specified directory.
+    List files and directories in a specified directory with pattern filtering.
+
+    This tool provides comprehensive directory listing capabilities including:
+    - Glob pattern filtering for selective file listing
+    - Organized output separating files and directories
+    - Permission and access error handling
+    - Relative path resolution for cleaner output
 
     Args:
-        directory: Directory path to list (default: current directory)
-        pattern: Glob pattern to filter files (default: "*" for all files)
+        directory: Directory path to list (default: current directory).
+                   Supports both relative and absolute paths.
+        pattern: Glob pattern to filter files and directories
+                (default: "*" for all files and directories).
+                Common patterns:
+                - "*.py" - Python files only
+                - "test_*" - Files/directories starting with "test_"
+                - "**/*.js" - All JavaScript files recursively
 
     Returns:
-        Dictionary with status and list of files/directories
+        ToolResponse: Standardized response containing either:
+            - Success: Formatted listing with files and directories separated
+            - Error: Detailed error message with error categorization
+
+    Example:
+        >>> result = await list_files("src", "*.py")
+        >>> print(result["status"])  # "success" or "error"
+        >>> print(result["content"][0]["text"])  # Formatted directory listing
+
+    Note:
+        - Uses glob patterns for flexible file matching
+        - Results are sorted alphabetically for better readability
+        - Shows directories first, then files
+        - Uses emoji indicators for visual clarity
     """
+    # Validate and resolve directory path
+    dir_path = validate_path(
+        directory,
+        operation_name="directory listing",
+        must_exist=True,
+        must_be_file=False
+    )
+
+    # Initialize collections for organized output
+    files: list[str] = []
+    directories: list[str] = []
+
     try:
-        # Resolve directory path
-        dir_path = Path(directory).resolve()
-
-        # Check if directory exists
-        if not dir_path.exists():
-            return {
-                "status": "error",
-                "content": [{"text": f"Directory not found: {directory}"}]
-            }
-
-        # Check if it's a directory
-        if not dir_path.is_dir():
-            return {
-                "status": "error",
-                "content": [{"text": f"Path is not a directory: {directory}"}]
-            }
-
-        # List files matching pattern
-        files = []
-        directories = []
-
+        # Use glob pattern to find matching items
         for item in dir_path.glob(pattern):
-            if item.is_file():
-                files.append(str(item.relative_to(dir_path)))
-            elif item.is_dir():
-                directories.append(str(item.relative_to(dir_path)))
+            try:
+                relative_path = str(item.relative_to(dir_path))
 
-        # Format output
-        output = f"Directory: {directory}\n\n"
+                if item.is_file():
+                    files.append(relative_path)
+                elif item.is_dir():
+                    directories.append(relative_path)
 
-        if directories:
-            output += "Directories:\n"
-            for d in sorted(directories):
-                output += f"  📁 {d}/\n"
-            output += "\n"
+            except ValueError as e:
+                # Handle cases where relative_to fails (e.g., different drives on Windows)
+                logger.warning(f"Could not get relative path for {item}: {e}")
+                continue
 
-        if files:
-            output += "Files:\n"
-            for f in sorted(files):
-                output += f"  📄 {f}\n"
+        # Sort results for consistent output
+        files.sort()
+        directories.sort()
 
-        if not directories and not files:
-            output += "No files or directories found matching the pattern.\n"
+        # Format organized output with visual indicators
+        formatted_output = _format_directory_listing(directory, directories, files)
 
-        return {
-            "status": "success",
-            "content": [{"text": output}]
-        }
+        total_items = len(directories) + len(files)
+        logger.info(
+            f"Listed directory '{directory}': "
+            f"{len(directories)} directories, {len(files)} files "
+            f"(pattern: '{pattern}')"
+        )
 
-    except PermissionError:
-        return {
-            "status": "error",
-            "content": [{"text": f"Permission denied: {directory}"}]
-        }
+        return create_success_response(
+            formatted_output,
+            metadata={
+                "directory_path": str(dir_path),
+                "pattern": pattern,
+                "directories_count": len(directories),
+                "files_count": len(files),
+                "total_items": total_items,
+                "directories": directories,
+                "files": files
+            }
+        )
+
     except Exception as e:
-        return {
-            "status": "error",
-            "content": [{"text": f"Error listing directory: {str(e)}"}]
-        }
+        # This should not happen due to the decorator, but added as safety net
+        logger.error(f"Unexpected error listing directory {directory}: {e}")
+        return create_error_response(
+            f"Unexpected error listing directory: {str(e)}",
+            "DirectoryListUnexpectedError"
+        )
+
+
+def _format_directory_listing(
+    directory: str,
+    directories: list[str],
+    files: list[str]
+) -> str:
+    """
+    Format directory listing output with visual organization.
+
+    Args:
+        directory: The directory path that was listed
+        directories: List of directory names found
+        files: List of file names found
+
+    Returns:
+        Formatted string with organized directory and file listing
+    """
+    # Start with header
+    output = f"📁 Directory: {directory}\n\n"
+
+    # Add directories section
+    if directories:
+        output += "📂 Directories:\n"
+        for dir_name in directories:
+            output += f"   📁 {dir_name}/\n"
+        output += "\n"
+
+    # Add files section
+    if files:
+        output += "📄 Files:\n"
+        for file_name in files:
+            output += f"   📄 {file_name}\n"
+        output += "\n"
+
+    # Handle empty results
+    if not directories and not files:
+        output += "   No files or directories found matching the pattern.\n"
+
+    return output
 
 
 @tool
+@handle_file_errors("codebase searching")
 async def search_codebase(
-    pattern: str,
-    directory: str = ".",
-    file_pattern: str = "*.py",
-    max_results: int = 50
-) -> Dict[str, any]:
+    pattern: SearchPattern,
+    directory: DirectoryName = ".",
+    file_pattern: FilePattern = "*.py",
+    max_results: MaxResults = 50
+) -> ToolResponse:
     """
-    Search for a pattern in the codebase using regular expressions.
+    Search for a pattern in the codebase using regular expressions with comprehensive filtering.
+
+    This tool provides powerful codebase search capabilities including:
+    - Regular expression pattern matching with case-insensitive option
+    - File type filtering using glob patterns
+    - Result limiting to prevent overwhelming output
+    - Recursive directory search
+    - Context preservation with line numbers and file paths
 
     Args:
-        pattern: Regular expression pattern to search for
-        directory: Directory to search in (default: current directory)
-        file_pattern: Glob pattern for files to search (default: "*.py")
-        max_results: Maximum number of results to return (default: 50)
+        pattern: Regular expression pattern to search for.
+                Supports standard regex syntax with flags applied automatically.
+        directory: Directory to search in (default: current directory).
+                   Supports both relative and absolute paths.
+        file_pattern: Glob pattern for files to search (default: "*.py").
+                      Examples: "*.js", "test_*.py", "**/*.json", "*.md"
+        max_results: Maximum number of results to return (default: 50).
+                    Prevents excessive output for large codebases.
 
     Returns:
-        Dictionary with status and search results
+        ToolResponse: Standardized response containing either:
+            - Success: Formatted search results with file paths and line numbers
+            - Error: Detailed error message with error categorization
+
+    Example:
+        >>> result = await search_codebase(
+        ...     pattern="class.*Agent",
+        ...     directory="src",
+        ...     file_pattern="*.py",
+        ...     max_results=10
+        ... )
+        >>> print(result["status"])  # "success" or "error"
+        >>> print(result["content"][0]["text"])  # Formatted search results
+
+    Note:
+        - Search is case-insensitive by default
+        - Uses multiline mode for pattern matching
+        - Skips files that cannot be read (binary files, permission issues)
+        - Results are numbered and sorted by discovery order
+        - Shows search statistics (files searched, matches found)
+
+    Raises:
+        ValueError: If the regex pattern is invalid
     """
+    # Validate and resolve search directory
+    dir_path = validate_path(
+        directory,
+        operation_name="codebase searching",
+        must_exist=True,
+        must_be_file=False
+    )
+
+    # Compile and validate regex pattern
     try:
-        # Resolve directory path
-        dir_path = Path(directory).resolve()
+        regex = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+        logger.debug(f"Compiled regex pattern: {pattern}")
+    except re.error as e:
+        error_msg = f"Invalid regular expression pattern: {pattern}"
+        logger.warning(f"Regex compilation failed: {error_msg} - {str(e)}")
+        return create_error_response(
+            f"{error_msg}. Details: {str(e)}",
+            "InvalidRegexPattern",
+            f"Pattern: {pattern}, Error: {str(e)}"
+        )
 
-        # Check if directory exists
-        if not dir_path.exists():
-            return {
-                "status": "error",
-                "content": [{"text": f"Directory not found: {directory}"}]
-            }
+    # Initialize search state
+    results: list[dict] = []
+    files_searched = 0
+    files_skipped = 0
 
-        # Compile regex pattern
-        try:
-            regex = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
-        except re.error as e:
-            return {
-                "status": "error",
-                "content": [{"text": f"Invalid regex pattern: {str(e)}"}]
-            }
-
-        # Search files
-        results = []
-        files_searched = 0
-
+    try:
+        # Search through files matching the file pattern
         for file_path in dir_path.rglob(file_pattern):
+            # Skip directories and non-files
             if not file_path.is_file():
                 continue
 
             files_searched += 1
 
             try:
-                async with aiofiles.open(file_path, mode='r', encoding='utf-8', errors='ignore') as f:
-                    content = await f.read()
+                # Read file content asynchronously with encoding fallback
+                async with aiofiles.open(
+                    file_path,
+                    mode='r',
+                    encoding='utf-8',
+                    errors='ignore'
+                ) as file:
+                    content = await file.read()
 
-                # Find all matches in the file
-                for line_num, line in enumerate(content.split('\n'), 1):
-                    if regex.search(line):
-                        results.append({
-                            "file": str(file_path.relative_to(dir_path)),
-                            "line": line_num,
-                            "content": line.strip()
-                        })
+                # Search for pattern matches in the file
+                file_matches = _search_file_content(
+                    content, regex, file_path, dir_path, max_results - len(results)
+                )
 
-                        # Stop if we've reached max results
-                        if len(results) >= max_results:
-                            break
+                # Add matches to results (if any)
+                if file_matches:
+                    results.extend(file_matches)
 
+                # Stop if we've reached the maximum number of results
+                if len(results) >= max_results:
+                    logger.info(
+                        f"Search stopped: reached max_results={max_results} "
+                        f"after searching {files_searched} files"
+                    )
+                    break
+
+            except PermissionError:
+                files_skipped += 1
+                logger.debug(f"Skipped file due to permissions: {file_path}")
+                continue
             except Exception as e:
-                # Skip files that can't be read
+                files_skipped += 1
+                logger.debug(f"Skipped file due to read error: {file_path} - {e}")
                 continue
 
-            if len(results) >= max_results:
-                break
+        # Format and return search results
+        formatted_output = _format_search_results(
+            pattern, directory, file_pattern, results, files_searched, files_skipped, max_results
+        )
 
-        # Format output
-        if not results:
-            output = f"No matches found for pattern: {pattern}\n"
-            output += f"Searched {files_searched} files in {directory}"
-        else:
-            output = f"Found {len(results)} matches for pattern: {pattern}\n"
-            output += f"(Searched {files_searched} files)\n\n"
+        logger.info(
+            f"Codebase search completed: pattern='{pattern}', "
+            f"directory='{directory}', file_pattern='{file_pattern}', "
+            f"matches={len(results)}, files_searched={files_searched}"
+        )
 
-            for i, result in enumerate(results, 1):
-                output += f"{i}. {result['file']}:{result['line']}\n"
-                output += f"   {result['content']}\n\n"
-
-            if len(results) >= max_results:
-                output += f"\nNote: Results limited to {max_results} matches.\n"
-
-        return {
-            "status": "success",
-            "content": [{"text": output}]
-        }
+        return create_success_response(
+            formatted_output,
+            metadata={
+                "search_pattern": pattern,
+                "search_directory": str(dir_path),
+                "file_pattern": file_pattern,
+                "matches_found": len(results),
+                "files_searched": files_searched,
+                "files_skipped": files_skipped,
+                "max_results_reached": len(results) >= max_results,
+                "results": results
+            }
+        )
 
     except Exception as e:
-        return {
-            "status": "error",
-            "content": [{"text": f"Error searching codebase: {str(e)}"}]
-        }
+        # This should not happen due to the decorator, but added as safety net
+        logger.error(f"Unexpected error during codebase search: {e}")
+        return create_error_response(
+            f"Unexpected error during codebase search: {str(e)}",
+            "CodebaseSearchUnexpectedError"
+        )
+
+
+def _search_file_content(
+    content: str,
+    regex: re.Pattern,
+    file_path: Path,
+    base_dir: Path,
+    remaining_results: int
+) -> list[dict]:
+    """
+    Search for pattern matches in file content.
+
+    Args:
+        content: File content to search through
+        regex: Compiled regex pattern
+        file_path: Path to the file being searched
+        base_dir: Base directory for relative path calculation
+        remaining_results: Maximum additional results to collect
+
+    Returns:
+        List of search result dictionaries
+    """
+    matches = []
+
+    try:
+        relative_path = str(file_path.relative_to(base_dir))
+    except ValueError:
+        # Fallback to absolute path if relative calculation fails
+        relative_path = str(file_path)
+
+    # Search line by line to preserve line numbers
+    for line_num, line in enumerate(content.split('\n'), 1):
+        if regex.search(line):
+            match_info = {
+                "file": relative_path,
+                "line": line_num,
+                "content": line.strip(),
+                "match_length": len(line.strip())
+            }
+            matches.append(match_info)
+
+            # Stop if we've collected enough results
+            if len(matches) >= remaining_results:
+                break
+
+    return matches
+
+
+def _format_search_results(
+    pattern: str,
+    directory: str,
+    file_pattern: str,
+    results: list[dict],
+    files_searched: int,
+    files_skipped: int,
+    max_results: int
+) -> str:
+    """
+    Format search results into a readable output.
+
+    Args:
+        pattern: Search pattern used
+        directory: Directory searched
+        file_pattern: File pattern used
+        results: List of search results
+        files_searched: Number of files successfully searched
+        files_skipped: Number of files skipped due to errors
+        max_results: Maximum results limit
+
+    Returns:
+        Formatted search results string
+    """
+    if not results:
+        return (
+            f"🔍 Search Results\n\n"
+            f"❌ No matches found for pattern: '{pattern}'\n"
+            f"📁 Directory: {directory}\n"
+            f"📄 File pattern: {file_pattern}\n"
+            f"📊 Files searched: {files_searched}\n"
+        )
+
+    output = (
+        f"🔍 Search Results\n\n"
+        f"✅ Found {len(results)} matches for pattern: '{pattern}'\n"
+        f"📁 Directory: {directory}\n"
+        f"📄 File pattern: {file_pattern}\n"
+        f"📊 Files searched: {files_searched}"
+    )
+
+    if files_skipped > 0:
+        output += f" (skipped {files_skipped} files)"
+
+    output += "\n\n"
+
+    # Format individual results
+    for i, result in enumerate(results, 1):
+        output += f"{i}. 📄 {result['file']}:{result['line']}\n"
+        output += f"   💡 {result['content']}\n\n"
+
+    # Add note if results were limited
+    if len(results) >= max_results:
+        output += f"⚠️  Note: Results limited to {max_results} matches.\n"
+
+    return output

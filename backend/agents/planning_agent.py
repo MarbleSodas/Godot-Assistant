@@ -20,6 +20,7 @@ from .tools import (
     fetch_webpage,
     get_godot_api_reference
 )
+from .tools.mcp_tools import MCPToolManager
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class PlanningAgent:
         self,
         api_key: Optional[str] = None,
         model_id: Optional[str] = None,
+        enable_mcp: Optional[bool] = None,
         **kwargs
     ):
         """
@@ -47,6 +49,7 @@ class PlanningAgent:
         Args:
             api_key: OpenRouter API key (defaults to config)
             model_id: Model ID to use (defaults to config)
+            enable_mcp: Enable MCP tools (defaults to config)
             **kwargs: Additional configuration options
         """
         # Get configuration
@@ -81,7 +84,7 @@ class PlanningAgent:
             else:
                 raise
 
-        # Define tools for the agent
+        # Define base tools for the agent
         self.tools = [
             read_file,
             list_files,
@@ -90,6 +93,14 @@ class PlanningAgent:
             fetch_webpage,
             get_godot_api_reference
         ]
+
+        # Track MCP manager for cleanup
+        self.mcp_manager: Optional[MCPToolManager] = None
+
+        # Initialize MCP tools if enabled
+        mcp_enabled = enable_mcp if enable_mcp is not None else AgentConfig.is_mcp_enabled()
+        if mcp_enabled:
+            self._initialize_mcp_tools_sync()
 
         # Initialize conversation manager for context handling
         self.conversation_manager = SlidingWindowConversationManager(
@@ -106,6 +117,69 @@ class PlanningAgent:
         )
 
         logger.info("Planning agent initialized successfully")
+
+    def _initialize_mcp_tools_sync(self):
+        """
+        Initialize MCP tools synchronously during agent construction.
+
+        This is a workaround since __init__ can't be async. MCP tools are
+        initialized lazily on first use.
+        """
+        try:
+            logger.info("MCP tools will be initialized on first agent invocation")
+            self.mcp_manager = MCPToolManager.get_instance()
+            # Note: Actual initialization happens in _ensure_mcp_initialized
+        except Exception as e:
+            error_msg = f"Failed to prepare MCP tool manager: {e}"
+            if AgentConfig.MCP_FAIL_SILENTLY:
+                logger.warning(error_msg)
+                logger.warning("Continuing without MCP tools")
+            else:
+                logger.error(error_msg)
+                raise
+
+    async def _ensure_mcp_initialized(self):
+        """
+        Ensure MCP tools are initialized before use.
+
+        This is called before agent invocations to lazily initialize MCP.
+        """
+        if self.mcp_manager and not self.mcp_manager.is_connected():
+            try:
+                logger.info("Initializing MCP tools...")
+                servers_config = AgentConfig.get_mcp_servers_config()
+                success = await self.mcp_manager.initialize(
+                    servers=servers_config,
+                    fail_silently=AgentConfig.MCP_FAIL_SILENTLY
+                )
+
+                if success:
+                    # Add MCP tools to the tools list
+                    mcp_tools = self.mcp_manager.get_all_tools()
+                    logger.info(f"Adding {len(mcp_tools)} MCP tools to agent")
+                    self.tools.extend(mcp_tools)
+
+                    # Recreate agent with updated tools
+                    self.agent = Agent(
+                        model=self.model,
+                        tools=self.tools,
+                        system_prompt=AgentConfig.PLANNING_AGENT_SYSTEM_PROMPT,
+                        conversation_manager=self.conversation_manager
+                    )
+
+                    connected_servers = self.mcp_manager.get_connected_servers()
+                    logger.info(f"MCP tools initialized successfully: {', '.join(connected_servers)}")
+                else:
+                    logger.warning("No MCP servers connected")
+
+            except Exception as e:
+                error_msg = f"Failed to initialize MCP tools: {e}"
+                if AgentConfig.MCP_FAIL_SILENTLY:
+                    logger.warning(error_msg)
+                    logger.warning("Continuing without MCP tools")
+                else:
+                    logger.error(error_msg)
+                    raise
 
     def plan(self, prompt: str) -> str:
         """
@@ -148,6 +222,9 @@ class PlanningAgent:
             Generated plan as a string
         """
         try:
+            # Ensure MCP tools are initialized
+            await self._ensure_mcp_initialized()
+
             result = await self.agent.invoke_async(prompt)
 
             # Extract text from result
@@ -185,6 +262,9 @@ class PlanningAgent:
                 "type": "start",
                 "data": {"message": "Starting plan generation..."}
             }
+
+            # Ensure MCP tools are initialized
+            await self._ensure_mcp_initialized()
 
             # Stream agent response
             async for event in self.agent.stream_async(prompt):
@@ -270,8 +350,18 @@ class PlanningAgent:
 
     async def close(self):
         """Close the agent and cleanup resources."""
+        # Cleanup MCP connections
+        if self.mcp_manager:
+            try:
+                await self.mcp_manager.cleanup()
+                logger.info("MCP tools cleaned up")
+            except Exception as e:
+                logger.error(f"Error cleaning up MCP tools: {e}")
+
+        # Close model
         if hasattr(self.model, 'close'):
             await self.model.close()
+
         logger.info("Planning agent closed")
 
 

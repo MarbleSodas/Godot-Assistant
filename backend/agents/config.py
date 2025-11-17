@@ -31,6 +31,20 @@ class AgentConfig:
     APP_NAME = os.getenv("APP_NAME", "Godot-Assistant")
     APP_URL = os.getenv("APP_URL", "http://localhost:8000")
 
+    # MCP Server Configuration
+    ENABLE_MCP_TOOLS = os.getenv("ENABLE_MCP_TOOLS", "true").lower() == "true"
+    MCP_FAIL_SILENTLY = os.getenv("MCP_FAIL_SILENTLY", "true").lower() == "true"
+
+    # Sequential Thinking MCP Server
+    ENABLE_SEQUENTIAL_THINKING = os.getenv("ENABLE_SEQUENTIAL_THINKING", "true").lower() == "true"
+    SEQUENTIAL_THINKING_COMMAND = os.getenv("SEQUENTIAL_THINKING_COMMAND", "npx")
+    SEQUENTIAL_THINKING_ARGS = os.getenv("SEQUENTIAL_THINKING_ARGS", "-y,@modelcontextprotocol/server-sequential-thinking").split(",")
+
+    # Context7 MCP Server
+    ENABLE_CONTEXT7 = os.getenv("ENABLE_CONTEXT7", "true").lower() == "true"
+    CONTEXT7_COMMAND = os.getenv("CONTEXT7_COMMAND", "npx")
+    CONTEXT7_ARGS = os.getenv("CONTEXT7_ARGS", "-y,@upstash/context7-mcp").split(",")
+
     # System Prompt for Planning Agent
     PLANNING_AGENT_SYSTEM_PROMPT = """You are a specialized planning agent designed to create detailed execution plans for other agents.
 
@@ -60,6 +74,22 @@ Use the available tools to:
 - Search the codebase for patterns and implementations
 - Fetch documentation and reference materials
 - Research best practices and solutions
+
+**Advanced Reasoning with Sequential Thinking:**
+When facing complex, multi-step problems that require deep analysis, use the sequential-thinking tool:
+- It provides step-by-step reasoning capabilities with hypothesis generation and verification
+- Useful for breaking down ambiguous requirements into concrete steps
+- Helps explore alternative approaches and identify edge cases
+- Enables iterative problem-solving with course correction
+- Best for: architectural decisions, complex algorithm design, debugging intricate issues
+
+**Library Documentation with Context7:**
+When you need up-to-date documentation for libraries and frameworks:
+1. Use `resolve-library-id` to find the correct library identifier (e.g., "fastapi" -> "/tiangolo/fastapi")
+2. Use `get-library-docs` with the resolved ID to fetch relevant documentation
+- Specify a `topic` parameter to focus on specific areas (e.g., "routing", "authentication")
+- Adjust `tokens` parameter to control documentation depth (default: 5000)
+- Best for: learning new APIs, finding usage examples, understanding best practices
 
 Be thorough, precise, and actionable. Your plans should enable another agent or developer to execute the task successfully without ambiguity."""
 
@@ -104,6 +134,45 @@ Be thorough, precise, and actionable. Your plans should enable another agent or 
             "app_name": cls.APP_NAME,
             "app_url": cls.APP_URL
         }
+
+    @classmethod
+    def get_mcp_servers_config(cls) -> dict:
+        """
+        Get MCP servers configuration.
+
+        Returns:
+            Dictionary of MCP server configurations
+        """
+        servers = {}
+
+        if cls.ENABLE_MCP_TOOLS:
+            if cls.ENABLE_SEQUENTIAL_THINKING:
+                servers["sequential-thinking"] = {
+                    "command": cls.SEQUENTIAL_THINKING_COMMAND,
+                    "args": cls.SEQUENTIAL_THINKING_ARGS,
+                    "prefix": "mcp__sequential_thinking__"
+                }
+
+            if cls.ENABLE_CONTEXT7:
+                servers["context7"] = {
+                    "command": cls.CONTEXT7_COMMAND,
+                    "args": cls.CONTEXT7_ARGS,
+                    "prefix": "mcp__context7__"
+                }
+
+        return servers
+
+    @classmethod
+    def is_mcp_enabled(cls) -> bool:
+        """
+        Check if MCP tools are enabled.
+
+        Returns:
+            bool: True if MCP tools should be loaded
+        """
+        return cls.ENABLE_MCP_TOOLS and (
+            cls.ENABLE_SEQUENTIAL_THINKING or cls.ENABLE_CONTEXT7
+        )
 
 
 # Validate configuration on module import
