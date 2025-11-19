@@ -225,3 +225,162 @@ async def get_agent_config():
     except Exception as e:
         logger.error(f"Error getting config: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Session Management Routes
+
+class SessionRequest(BaseModel):
+    """Request model for session creation."""
+    session_id: str = Field(..., description="Unique session identifier", min_length=1)
+
+
+class ChatRequest(BaseModel):
+    """Request model for chat message."""
+    message: str = Field(..., description="User message", min_length=1)
+
+
+@router.post("/sessions", response_model=dict)
+async def create_session(request: SessionRequest):
+    """
+    Create a new multi-agent session.
+    
+    Args:
+        request: SessionRequest with session_id
+        
+    Returns:
+        Session details
+    """
+    try:
+        from agents.multi_agent_manager import get_multi_agent_manager
+        manager = get_multi_agent_manager()
+        
+        session_id = manager.create_session(request.session_id)
+        
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "message": "Session created successfully"
+        }
+    except Exception as e:
+        logger.error(f"Error creating session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/sessions", response_model=dict)
+async def list_sessions():
+    """
+    List all available sessions.
+    
+    Returns:
+        List of sessions
+    """
+    try:
+        from agents.multi_agent_manager import get_multi_agent_manager
+        manager = get_multi_agent_manager()
+        
+        sessions = manager.list_sessions()
+        
+        return {
+            "status": "success",
+            "sessions": sessions
+        }
+    except Exception as e:
+        logger.error(f"Error listing sessions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/sessions/{session_id}", response_model=dict)
+async def get_session(session_id: str):
+    """
+    Get session details.
+    
+    Args:
+        session_id: Session ID
+        
+    Returns:
+        Session details
+    """
+    try:
+        from agents.multi_agent_manager import get_multi_agent_manager
+        manager = get_multi_agent_manager()
+        
+        session = manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+            
+        return {
+            "status": "success",
+            "session": session
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/sessions/{session_id}", response_model=dict)
+async def delete_session(session_id: str):
+    """
+    Delete a session.
+    
+    Args:
+        session_id: Session ID
+        
+    Returns:
+        Status message
+    """
+    try:
+        from agents.multi_agent_manager import get_multi_agent_manager
+        manager = get_multi_agent_manager()
+        
+        success = manager.delete_session(session_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Session not found or could not be deleted")
+            
+        return {
+            "status": "success",
+            "message": "Session deleted successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/sessions/{session_id}/chat", response_model=dict)
+async def chat_session(session_id: str, request: ChatRequest):
+    """
+    Send a message to a session.
+    
+    Args:
+        session_id: Session ID
+        request: ChatRequest with message
+        
+    Returns:
+        Agent response
+    """
+    try:
+        from agents.multi_agent_manager import get_multi_agent_manager
+        manager = get_multi_agent_manager()
+        
+        # Process message
+        # Note: This might take time, so in a real app we might want streaming or background tasks
+        result = await manager.process_message(session_id, request.message)
+        
+        # Format result
+        response_text = str(result)
+        if hasattr(result, 'message') and isinstance(result.message, dict):
+             content = result.message.get('content')
+             if isinstance(content, list) and len(content) > 0:
+                 response_text = content[0].get('text', response_text)
+        
+        return {
+            "status": "success",
+            "response": response_text,
+            "raw_result": str(result)
+        }
+    except Exception as e:
+        logger.error(f"Error processing chat: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
