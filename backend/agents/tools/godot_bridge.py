@@ -18,7 +18,6 @@ from websockets.exceptions import ConnectionClosed, ConnectionClosedError
 
 from strands import tool
 from ..config import AgentConfig
-from .godot_security import get_security_validator, set_security_context, create_default_security_context
 
 logger = logging.getLogger(__name__)
 
@@ -86,11 +85,7 @@ class GodotBridge:
         self.connection_state = ConnectionState.DISCONNECTED
         self.project_info: Optional[GodotProjectInfo] = None
 
-        # Security
-        self.security_validator = get_security_validator()
-        self.security_context = create_default_security_context()
-        set_security_context(self.security_context)
-
+  
         # Command management
         self._command_id_counter = 0
         self._pending_commands: Dict[str, asyncio.Future] = {}
@@ -211,21 +206,7 @@ class GodotBridge:
             if not await self.connect():
                 raise ConnectionError("Failed to connect to Godot plugin")
 
-        # Security validation
-        validation_result = self.security_validator.validate_operation(command_type, kwargs)
-        if not validation_result.allowed:
-            error_msg = validation_result.reason or "Operation not allowed by security policy"
-            logger.error(f"Security validation failed for command {command_type}: {error_msg}")
-            return CommandResponse(
-                success=False,
-                error=f"Security validation failed: {error_msg}"
-            )
-
-        # Log warnings
-        if validation_result.warnings:
-            for warning in validation_result.warnings:
-                logger.warning(f"Security warning for {command_type}: {warning}")
-
+    
         # Generate unique command ID
         self._command_id_counter += 1
         command_id = f"cmd_{self._command_id_counter}"
@@ -344,11 +325,7 @@ class GodotBridge:
         project_data = data.get("data", {})
         self.project_info = GodotProjectInfo(**project_data)
 
-        # Update security context with project path
-        if self.project_info.project_path:
-            self.security_context.set_project_path(self.project_info.project_path)
-            set_security_context(self.security_context)
-
+      
         logger.info(f"Received project info: {self.project_info.project_path}")
 
     async def _handle_command_response(self, data: Dict[str, Any]):
