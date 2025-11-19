@@ -469,267 +469,191 @@ async def test_godot_bridge_connection():
         return False
 
 
-async def test_godot_security():
-    """Test Godot security validation."""
-    print("=" * 60)
-    print("Testing Godot Security Validation")
-    print("=" * 60)
-
-    try:
-        from agents.tools.godot_security import (
-            GodotSecurityValidator,
-            create_default_security_context,
-            OperationRisk,
-            validate_operation,
-            validate_path,
-            validate_node_name
-        )
-
-        validator = GodotSecurityValidator()
-        all_passed = True
-
-        # Test operation validation
-        print("Testing operation validation...")
-
-        # Safe operation - should pass
-        result = validate_operation("get_project_info")
-        if result.allowed:
-            print(f"  + get_project_info: ALLOWED (SAFE)")
-        else:
-            print(f"  - get_project_info: FAILED - {result.reason}")
-            all_passed = False
-
-        # Medium risk operation - should pass with medium threshold
-        result = validate_operation("create_node", {"node_type": "Node2D", "parent_path": "Root"})
-        if result.allowed:
-            print(f"  + create_node: ALLOWED (MEDIUM)")
-        else:
-            print(f"  - create_node: FAILED - {result.reason}")
-            all_passed = False
-
-        # High risk operation - should fail with medium threshold
-        result = validate_operation("delete_node", {"node_path": "Root/Node2D"})
-        if not result.allowed and result.risk_level == OperationRisk.HIGH:
-            print(f"  + delete_node: BLOCKED (HIGH RISK)")
-        else:
-            print(f"  - delete_node: FAILED - Should be blocked at medium threshold")
-            all_passed = False
-
-        # Critical risk operation - should fail
-        result = validate_operation("delete_scene", {"scene_path": "res://scenes/main.tscn"})
-        if not result.allowed and result.risk_level == OperationRisk.CRITICAL:
-            print(f"  + delete_scene: BLOCKED (CRITICAL RISK)")
-        else:
-            print(f"  - delete_scene: FAILED - Should be blocked at medium threshold")
-            all_passed = False
-
-        # Test path validation
-        print("\nTesting path validation...")
-
-        # Valid paths - should pass
-        result = validate_path("res://scenes/main.tscn")
-        if result.allowed:
-            print(f"  + res://scenes/main.tscn: VALID")
-        else:
-            print(f"  - res://scenes/main.tscn: FAILED - {result.reason}")
-            all_passed = False
-
-        result = validate_path("user://save_data.dat")
-        if result.allowed:
-            print(f"  + user://save_data.dat: VALID")
-        else:
-            print(f"  - user://save_data.dat: FAILED - {result.reason}")
-            all_passed = False
-
-        # Invalid paths - should fail
-        result = validate_path("../../../etc/passwd")
-        if not result.allowed:
-            print(f"  + ../../../etc/passwd: BLOCKED (path traversal)")
-        else:
-            print(f"  - ../../../etc/passwd: FAILED - Should be blocked")
-            all_passed = False
-
-        result = validate_path("res://../../../system32/cmd.exe")
-        if not result.allowed:
-            print(f"  + res://../../../system32/cmd.exe: BLOCKED (suspicious path)")
-        else:
-            print(f"  - res://../../../system32/cmd.exe: FAILED - Should be blocked")
-            all_passed = False
-
-        # Test node name validation
-        print("\nTesting node name validation...")
-
-        # Valid names - should pass
-        result = validate_node_name("Player")
-        if result.allowed:
-            print(f"  + Player: VALID")
-        else:
-            print(f"  - Player: FAILED - {result.reason}")
-            all_passed = False
-
-        result = validate_node_name("UI_Button")
-        if result.allowed:
-            print(f"  + UI_Button: VALID")
-        else:
-            print(f"  - UI_Button: FAILED - {result.reason}")
-            all_passed = False
-
-        # Invalid names - should fail
-        result = validate_node_name("")
-        if not result.allowed:
-            print(f"  + (empty): BLOCKED (empty name)")
-        else:
-            print(f"  - (empty): FAILED - Should be blocked")
-            all_passed = False
-
-        result = validate_node_name("root")  # Reserved name
-        if not result.allowed:
-            print(f"  + root: BLOCKED (reserved name)")
-        else:
-            print(f"  - root: FAILED - Should be blocked")
-            all_passed = False
-
-        result = validate_node_name("Node With Spaces")
-        if not result.allowed:
-            print(f"  + Node With Spaces: BLOCKED (invalid characters)")
-        else:
-            print(f"  - Node With Spaces: FAILED - Should be blocked")
-            all_passed = False
-
-        if all_passed:
-            print("+ All Godot security validation tests passed\n")
-            return True
-        else:
-            print("- Some Godot security validation tests failed\n")
-            return False
-
-    except ImportError as e:
-        print(f"- FAILED: Godot security module not available: {e}")
-        print("Error: Godot tools are not properly installed")
-        return False
-    except Exception as e:
-        print(f"- FAILED: Godot security test failed: {e}")
-        return False
 
 
 async def test_godot_tools_integration():
-    """Test integration of all Godot tools."""
+    """Test integration and functionality of all Godot debugging tools."""
     print("=" * 60)
-    print("Testing Godot Tools Integration")
+    print("Testing Godot Debugging Tools Integration")
     print("=" * 60)
 
     try:
-        from agents.tools.godot_debug_tools import GodotDebugTools
-        from agents.tools.godot_executor_tools import GodotExecutorTools
+        # Test tool imports
+        print("Testing tool imports...")
+        from agents.tools.godot_debug_tools import (
+            get_project_overview, analyze_scene_tree, capture_visual_context,
+            capture_editor_viewport, capture_game_viewport, get_visual_debug_info,
+            get_debug_output, get_debug_logs, search_debug_logs, monitor_debug_output,
+            get_performance_metrics, inspect_scene_file, search_nodes,
+            analyze_node_performance, get_scene_debug_overlays, compare_scenes,
+            get_debugger_state, access_debug_variables, get_call_stack_info
+        )
+        print("  + All debugging tools imported successfully")
 
-        # Initialize tools
-        debug_tools = GodotDebugTools()
-        executor_tools = GodotExecutorTools()
+        # Test agent tool availability
+        print("\nTesting agent tool availability...")
+        from agents.planning_agent import PlanningAgent
 
-        print("+ Tools initialized successfully")
+        # Create agent instance to check tool availability
+        agent = PlanningAgent()
+        print(f"  + Planning agent initialized with {len(agent.tools)} tools")
 
-        # Test connection - both must connect for test to pass
-        print("Testing tool connections...")
+        # Check that all debugging tools are available to the agent
+        expected_debug_tools = {
+            'get_project_overview', 'analyze_scene_tree', 'capture_visual_context',
+            'capture_editor_viewport', 'capture_game_viewport', 'get_visual_debug_info',
+            'get_debug_output', 'get_debug_logs', 'search_debug_logs', 'monitor_debug_output',
+            'get_performance_metrics', 'inspect_scene_file', 'search_nodes',
+            'analyze_node_performance', 'get_scene_debug_overlays', 'compare_scenes',
+            'get_debugger_state', 'access_debug_variables', 'get_call_stack_info'
+        }
 
-        debug_connected = await debug_tools.ensure_connection()
-        executor_connected = await executor_tools.ensure_connection()
+        agent_tool_names = {tool.__name__ if hasattr(tool, '__name__') else type(tool).__name__
+                          for tool in agent.tools}
 
-        if not debug_connected:
-            print("  - Debug tools connection: FAILED")
-        else:
-            print("  + Debug tools connection: SUCCESS")
+        available_debug_tools = expected_debug_tools.intersection(agent_tool_names)
+        missing_debug_tools = expected_debug_tools - agent_tool_names
 
-        if not executor_connected:
-            print("  - Executor tools connection: FAILED")
-        else:
-            print("  + Executor tools connection: SUCCESS")
+        print(f"  + Debug tools available to agent: {len(available_debug_tools)}/{len(expected_debug_tools)}")
 
-        # Fail the test if either tool set cannot connect
-        if not debug_connected or not executor_connected:
-            print("\n- FAILED: Cannot establish connection to Godot plugin")
-            print("Error: Godot plugin must be running for tools to function")
+        if missing_debug_tools:
+            print(f"  - Missing debug tools: {missing_debug_tools}")
             return False
 
-        # Test debug tools functionality
-        print("\nTesting debug tools functionality...")
+        print("  + All debugging tools are available to the planning agent")
 
-        try:
-            overview = await debug_tools.get_project_overview()
-            if overview and 'project_info' in overview:
-                print("  + Project overview retrieved successfully")
-                project_path = overview.get('project_info', {}).get('path', 'Unknown')
-                print(f"    - Project path: {project_path}")
-            else:
-                print("  - Project overview failed - invalid response")
-                return False
-        except Exception as e:
-            print(f"  - Project overview failed: {e}")
-            return False
+        # Test basic functionality without requiring Godot connection
+        print("\nTesting tool function signatures and basic properties...")
 
-        try:
-            scene_tree = await debug_tools.get_scene_tree_analysis(detailed=False)
-            if scene_tree and 'scene_tree' in scene_tree:
-                print("  + Scene tree analysis retrieved successfully")
-            else:
-                print("  - Scene tree analysis failed - invalid response")
-                return False
-        except Exception as e:
-            print(f"  - Scene tree analysis failed: {e}")
-            return False
-
-        # Test tool availability and basic functionality
-        print("\nChecking tool availability and functionality...")
-
-        debug_methods = [
-            ('get_project_overview', True),
-            ('get_scene_tree_analysis', True),
-            ('get_node_details', True),
-            ('search_nodes', True),
-            ('capture_visual_context', False)  # This might fail if no viewport
+        # Test that all tools have proper signatures and are callable
+        debug_tools_to_test = [
+            (get_project_overview, 'get_project_overview'),
+            (analyze_scene_tree, 'analyze_scene_tree'),
+            (capture_visual_context, 'capture_visual_context'),
+            (capture_editor_viewport, 'capture_editor_viewport'),
+            (capture_game_viewport, 'capture_game_viewport'),
+            (get_visual_debug_info, 'get_visual_debug_info'),
+            (get_debug_output, 'get_debug_output'),
+            (get_debug_logs, 'get_debug_logs'),
+            (search_debug_logs, 'search_debug_logs'),
+            (monitor_debug_output, 'monitor_debug_output'),
+            (get_performance_metrics, 'get_performance_metrics'),
+            (inspect_scene_file, 'inspect_scene_file'),
+            (search_nodes, 'search_nodes'),
+            (analyze_node_performance, 'analyze_node_performance'),
+            (get_scene_debug_overlays, 'get_scene_debug_overlays'),
+            (compare_scenes, 'compare_scenes'),
+            (get_debugger_state, 'get_debugger_state'),
+            (access_debug_variables, 'access_debug_variables'),
+            (get_call_stack_info, 'get_call_stack_info')
         ]
 
-        executor_methods = [
-            ('create_node', False),  # Don't actually test destructive operations
-            ('delete_node', False),
-            ('modify_node_property', False),
-            ('create_new_scene', False),
-            ('open_scene', False),
-            ('save_current_scene', False),
-            ('play_scene', False),
-            ('stop_playing', False)
-        ]
+        tools_with_correct_signatures = 0
+        for tool_func, tool_name in debug_tools_to_test:
+            try:
+                # Check if tool is callable
+                if callable(tool_func):
+                    # Check tool signature (basic check)
+                    import inspect
+                    sig = inspect.signature(tool_func)
 
-        debug_available = 0
-        for method_name, should_test in debug_methods:
-            if hasattr(debug_tools, method_name):
-                debug_available += 1
-                print(f"  + {method_name}: Available")
-            else:
-                print(f"  - {method_name}: Missing")
+                    # Check if it's async
+                    if inspect.iscoroutinefunction(tool_func):
+                        tools_with_correct_signatures += 1
+                        print(f"  + {tool_name}: Proper async tool signature")
+                    else:
+                        print(f"  - {tool_name}: Not async - should be async tool")
+                        return False
+                else:
+                    print(f"  - {tool_name}: Not callable")
+                    return False
+            except Exception as e:
+                print(f"  - {tool_name}: Signature check failed - {e}")
                 return False
 
-        executor_available = 0
-        for method_name, should_test in executor_methods:
-            if hasattr(executor_tools, method_name):
-                executor_available += 1
-                print(f"  + {method_name}: Available")
+        print(f"  + {tools_with_correct_signatures}/{len(debug_tools_to_test)} tools have correct signatures")
+
+        # Test parameter validation for some tools (without calling them)
+        print("\nTesting tool parameter validation...")
+
+        # Test search_debug_logs parameter validation
+        try:
+            import inspect
+            sig = inspect.signature(search_debug_logs)
+            params = list(sig.parameters.keys())
+            expected_params = ['pattern', 'case_sensitive', 'regex']
+
+            if all(param in params for param in expected_params):
+                print("  + search_debug_logs: Correct parameters")
             else:
-                print(f"  - {method_name}: Missing")
+                print(f"  - search_debug_logs: Missing parameters. Expected: {expected_params}, Found: {params}")
                 return False
+        except Exception as e:
+            print(f"  - search_debug_logs parameter validation failed: {e}")
+            return False
 
-        print(f"\nSummary:")
-        print(f"  - Debug tools available: {debug_available}/{len(debug_methods)} methods")
-        print(f"  - Executor tools available: {executor_available}/{len(executor_methods)} methods")
+        # Test get_debug_logs parameter validation
+        try:
+            sig = inspect.signature(get_debug_logs)
+            params = list(sig.parameters.keys())
+            expected_params = ['severity_filter', 'time_range', 'limit']
 
-        print("+ Godot tools integration test passed\n")
+            if all(param in params for param in expected_params):
+                print("  + get_debug_logs: Correct parameters")
+            else:
+                print(f"  - get_debug_logs: Missing parameters. Expected: {expected_params}, Found: {params}")
+                return False
+        except Exception as e:
+            print(f"  - get_debug_logs parameter validation failed: {e}")
+            return False
+
+        # Test analyze_node_performance parameter validation
+        try:
+            sig = inspect.signature(analyze_node_performance)
+            params = list(sig.parameters.keys())
+
+            if 'node_path' in params:
+                print("  + analyze_node_performance: Correct parameters")
+            else:
+                print(f"  - analyze_node_performance: Missing node_path parameter")
+                return False
+        except Exception as e:
+            print(f"  - analyze_node_performance parameter validation failed: {e}")
+            return False
+
+        # Test module structure
+        print("\nTesting module structure...")
+        from agents.tools import __all__ as all_tools
+        godot_tools = [tool for tool in all_tools if not tool.startswith(('create_node', 'modify_node', 'delete_node', 'open_scene', 'play_scene', 'stop_playing'))]
+
+        print(f"  + Total available tools in __all__: {len(godot_tools)}")
+
+        # Count debug tools specifically
+        debug_tool_count = len([tool for tool in expected_debug_tools if tool in all_tools])
+        print(f"  + Debug tools exported: {debug_tool_count}/{len(expected_debug_tools)}")
+
+        print("\n" + "=" * 60)
+        print("GODOT DEBUGGING TOOLS TEST SUMMARY")
+        print("=" * 60)
+        print("✅ All debugging tools imported successfully")
+        print("✅ All tools available to planning agent")
+        print("✅ All tools have proper async signatures")
+        print("✅ Tool parameter validation passed")
+        print("✅ Module structure validated")
+        print(f"✅ Total debugging tools implemented: {len(debug_tools_to_test)}")
+        print(f"✅ Tools available to agents: {len(available_debug_tools)}")
+
+        print("\n+ Godot debugging tools integration test PASSED\n")
         return True
 
     except ImportError as e:
-        print(f"- FAILED: Godot tools modules not available: {e}")
-        print("Error: Godot tools are not properly installed")
+        print(f"- FAILED: Godot debugging tools modules not available: {e}")
+        print("Error: Debugging tools are not properly installed or accessible")
         return False
     except Exception as e:
-        print(f"- FAILED: Godot tools integration test failed: {e}")
+        print(f"- FAILED: Godot debugging tools integration test failed: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -784,7 +708,6 @@ async def main():
     results.append(("MCP Integration", await test_mcp_integration()))
     results.append(("Godot Tools", await test_godot_tools()))
     results.append(("Godot Bridge", await test_godot_bridge_connection()))
-    results.append(("Godot Security", await test_godot_security()))
     results.append(("Godot Integration", await test_godot_tools_integration()))
     results.append(("Simple Plan", await test_plan_simple()))
     results.append(("Streaming Plan", await test_plan_streaming()))

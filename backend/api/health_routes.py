@@ -280,7 +280,6 @@ async def tools_health():
             "godot_bridge": ["ensure_godot_connection"],
             "godot_debug": ["get_project_overview", "analyze_scene_tree", "capture_visual_context", "search_nodes"],
             "godot_executor": ["create_node", "modify_node_property", "create_scene", "open_scene", "select_nodes", "play_scene", "stop_playing"],
-            "godot_security": ["validate_operation", "validate_path", "validate_node_name"]
         }
 
         available_tools = {}
