@@ -609,7 +609,7 @@ class TestConvenienceFunctions:
     async def test_get_project_overview_function(self, mock_godot_bridge, mock_project_info):
         """Test get_project_overview convenience function."""
         mock_godot_bridge.get_project_info = AsyncMock(return_value=mock_project_info)
-        mock_godot_bridge.send_command = AsyncMock(return_value=MagicMock(success=True, data={})))
+        mock_godot_bridge.send_command = AsyncMock(return_value=MagicMock(success=True, data={}))
 
         with patch('agents.tools.godot_debug_tools.get_godot_bridge', return_value=mock_godot_bridge):
             result = await get_project_overview()

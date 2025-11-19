@@ -550,6 +550,298 @@ class GodotExecutorTools:
 
         return results
 
+    # Advanced Creation and Deletion Operations
+    async def duplicate_node(self, node_path: str, new_name: Optional[str] = None) -> CreationResult:
+        """
+        Duplicate an existing node in the scene tree.
+
+        Args:
+            node_path: Path to the node to duplicate
+            new_name: Name for the duplicated node (optional)
+
+        Returns:
+            CreationResult with operation outcome
+        """
+        if not await self.ensure_connection():
+            raise ConnectionError("Failed to connect to Godot plugin")
+
+        try:
+            params = {"node_path": node_path}
+            if new_name:
+                params["new_name"] = new_name
+
+            response = await self.bridge.send_command("duplicate_node", **params)
+
+            if response.success:
+                duplicated_path = response.data.get("path")
+                self._record_operation("duplicate_node", node_path, True, params)
+                logger.info(f"Duplicated node {node_path} to {duplicated_path}")
+
+                return CreationResult(
+                    success=True,
+                    created_path=duplicated_path,
+                    created_id=response.data.get("id")
+                )
+            else:
+                error_msg = response.error or "Unknown error"
+                self._record_operation("duplicate_node", node_path, False, {"error": error_msg})
+                logger.error(f"Failed to duplicate node: {error_msg}")
+
+                return CreationResult(success=False, error=error_msg)
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error duplicating node: {error_msg}")
+            self._record_operation("duplicate_node", node_path, False, {"error": error_msg})
+            return CreationResult(success=False, error=error_msg)
+
+    async def create_resource(
+        self,
+        resource_type: str,
+        resource_path: str,
+        initial_data: Optional[Dict[str, Any]] = None
+    ) -> CreationResult:
+        """
+        Create a new Godot resource file.
+
+        Args:
+            resource_type: Type of resource to create
+            resource_path: Path where to save the resource
+            initial_data: Initial data for the resource (optional)
+
+        Returns:
+            CreationResult with operation outcome
+        """
+        if not await self.ensure_connection():
+            raise ConnectionError("Failed to connect to Godot plugin")
+
+        try:
+            params = {
+                "resource_type": resource_type,
+                "resource_path": resource_path
+            }
+            if initial_data:
+                params["initial_data"] = initial_data
+
+            response = await self.bridge.send_command("create_resource", **params)
+
+            if response.success:
+                created_path = response.data.get("path")
+                self._record_operation("create_resource", resource_path, True, params)
+                logger.info(f"Created resource {resource_type} at {created_path}")
+
+                return CreationResult(success=True, created_path=created_path)
+            else:
+                error_msg = response.error or "Unknown error"
+                self._record_operation("create_resource", resource_path, False, {"error": error_msg})
+                logger.error(f"Failed to create resource: {error_msg}")
+
+                return CreationResult(success=False, error=error_msg)
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error creating resource: {error_msg}")
+            self._record_operation("create_resource", resource_path, False, {"error": error_msg})
+            return CreationResult(success=False, error=error_msg)
+
+    async def delete_resource(self, resource_path: str) -> bool:
+        """
+        Delete a Godot resource file.
+
+        Args:
+            resource_path: Path to the resource file to delete
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not await self.ensure_connection():
+            raise ConnectionError("Failed to connect to Godot plugin")
+
+        try:
+            response = await self.bridge.send_command("delete_resource", resource_path=resource_path)
+
+            if response.success:
+                self._record_operation("delete_resource", resource_path, True)
+                logger.info(f"Deleted resource: {resource_path}")
+                return True
+            else:
+                error_msg = response.error or "Unknown error"
+                self._record_operation("delete_resource", resource_path, False, {"error": error_msg})
+                logger.error(f"Failed to delete resource: {error_msg}")
+                return False
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error deleting resource: {error_msg}")
+            self._record_operation("delete_resource", resource_path, False, {"error": error_msg})
+            return False
+
+    async def attach_script_to_node(self, node_path: str, script_path: str) -> bool:
+        """
+        Attach a GDScript to a node.
+
+        Args:
+            node_path: Path to the target node
+            script_path: Path to the GDScript file
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not await self.ensure_connection():
+            raise ConnectionError("Failed to connect to Godot plugin")
+
+        try:
+            response = await self.bridge.send_command(
+                "attach_script_to_node",
+                node_path=node_path,
+                script_path=script_path
+            )
+
+            if response.success:
+                self._record_operation("attach_script", node_path, True, {"script_path": script_path})
+                logger.info(f"Attached script {script_path} to {node_path}")
+                return True
+            else:
+                error_msg = response.error or "Unknown error"
+                self._record_operation("attach_script", node_path, False, {"error": error_msg})
+                logger.error(f"Failed to attach script: {error_msg}")
+                return False
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error attaching script: {error_msg}")
+            self._record_operation("attach_script", node_path, False, {"error": error_msg})
+            return False
+
+    async def create_and_attach_script(
+        self,
+        node_path: str,
+        script_content: str,
+        script_name: Optional[str] = None
+    ) -> CreationResult:
+        """
+        Create a new GDScript and attach it to a node.
+
+        Args:
+            node_path: Path to the target node
+            script_content: Content of the GDScript
+            script_name: Name for the script file (optional)
+
+        Returns:
+            CreationResult with operation outcome
+        """
+        if not await self.ensure_connection():
+            raise ConnectionError("Failed to connect to Godot plugin")
+
+        try:
+            params = {
+                "node_path": node_path,
+                "script_content": script_content
+            }
+            if script_name:
+                params["script_name"] = script_name
+
+            response = await self.bridge.send_command("create_and_attach_script", **params)
+
+            if response.success:
+                script_path = response.data.get("script_path")
+                self._record_operation("create_and_attach_script", node_path, True, params)
+                logger.info(f"Created and attached script {script_path} to {node_path}")
+
+                return CreationResult(success=True, created_path=script_path)
+            else:
+                error_msg = response.error or "Unknown error"
+                self._record_operation("create_and_attach_script", node_path, False, {"error": error_msg})
+                logger.error(f"Failed to create and attach script: {error_msg}")
+
+                return CreationResult(success=False, error=error_msg)
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error creating and attaching script: {error_msg}")
+            self._record_operation("create_and_attach_script", node_path, False, {"error": error_msg})
+            return CreationResult(success=False, error=error_msg)
+
+    async def create_node_with_script(
+        self,
+        node_type: str,
+        parent_path: str,
+        script_content: str,
+        node_name: Optional[str] = None,
+        properties: Optional[Dict[str, Any]] = None
+    ) -> CreationResult:
+        """
+        Create a node with an attached script in one operation.
+
+        Args:
+            node_type: Type of node to create
+            parent_path: Path to parent node
+            script_content: Content of the script to attach
+            node_name: Name for the new node (optional)
+            properties: Initial properties for the node (optional)
+
+        Returns:
+            CreationResult with operation outcome
+        """
+        if not await self.ensure_connection():
+            raise ConnectionError("Failed to connect to Godot plugin")
+
+        try:
+            params = {
+                "node_type": node_type,
+                "parent_path": parent_path,
+                "script_content": script_content
+            }
+            if node_name:
+                params["node_name"] = node_name
+            if properties:
+                params["properties"] = properties
+
+            response = await self.bridge.send_command("create_node_with_script", **params)
+
+            if response.success:
+                created_path = response.data.get("path")
+                script_path = response.data.get("script_path")
+                self._record_operation("create_node_with_script", parent_path, True, params)
+                logger.info(f"Created node {node_type} with script at {created_path}")
+
+                return CreationResult(
+                    success=True,
+                    created_path=created_path,
+                    created_id=response.data.get("id")
+                )
+            else:
+                error_msg = response.error or "Unknown error"
+                self._record_operation("create_node_with_script", parent_path, False, {"error": error_msg})
+                logger.error(f"Failed to create node with script: {error_msg}")
+
+                return CreationResult(success=False, error=error_msg)
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error creating node with script: {error_msg}")
+            self._record_operation("create_node_with_script", parent_path, False, {"error": error_msg})
+            return CreationResult(success=False, error=error_msg)
+
+    async def delete_node_batch(self, node_paths: List[str]) -> List[bool]:
+        """
+        Delete multiple nodes in a batch operation.
+
+        Args:
+            node_paths: List of node paths to delete
+
+        Returns:
+            List of bool indicating success for each deletion
+        """
+        results = []
+
+        for node_path in node_paths:
+            result = await self.delete_node(node_path)
+            results.append(result)
+            await asyncio.sleep(0.1)  # Small delay between operations
+
+        return results
+
     # Utility Methods
     async def get_operation_history(self) -> List[Dict[str, Any]]:
         """
@@ -723,3 +1015,165 @@ async def delete_node(node_path: str) -> bool:
     """
     tools = GodotExecutorTools()
     return await tools.delete_node(node_path)
+
+
+@tool
+async def reparent_node(node_path: str, new_parent_path: str, **kwargs) -> bool:
+    """Move a node to a new parent in the scene tree.
+
+    Args:
+        node_path: Path to the node to move
+        new_parent_path: Path to the new parent node
+        **kwargs: Additional options like position index
+
+    Returns:
+        bool: True if node was reparented successfully, False otherwise
+    """
+    tools = GodotExecutorTools()
+    return await tools.reparent_node(node_path, new_parent_path, **kwargs)
+
+
+@tool
+async def duplicate_node(node_path: str, new_name: Optional[str] = None) -> CreationResult:
+    """Duplicate an existing node in the scene tree.
+
+    Args:
+        node_path: Path to the node to duplicate
+        new_name: Name for the duplicated node (optional)
+
+    Returns:
+        CreationResult with operation outcome
+    """
+    tools = GodotExecutorTools()
+    return await tools.duplicate_node(node_path, new_name)
+
+
+@tool
+async def create_resource(
+    resource_type: str,
+    resource_path: str,
+    initial_data: Optional[Dict[str, Any]] = None
+) -> CreationResult:
+    """Create a new Godot resource file.
+
+    Args:
+        resource_type: Type of resource to create (e.g., "ShaderMaterial", "GDScript")
+        resource_path: Path where to save the resource
+        initial_data: Initial data for the resource (optional)
+
+    Returns:
+        CreationResult with operation outcome
+    """
+    tools = GodotExecutorTools()
+    return await tools.create_resource(resource_type, resource_path, initial_data)
+
+
+@tool
+async def delete_resource(resource_path: str) -> bool:
+    """Delete a Godot resource file.
+
+    Args:
+        resource_path: Path to the resource file to delete
+
+    Returns:
+        bool: True if resource was deleted successfully, False otherwise
+    """
+    tools = GodotExecutorTools()
+    return await tools.delete_resource(resource_path)
+
+
+@tool
+async def attach_script_to_node(node_path: str, script_path: str) -> bool:
+    """Attach a GDScript to a node.
+
+    Args:
+        node_path: Path to the target node
+        script_path: Path to the GDScript file
+
+    Returns:
+        bool: True if script was attached successfully, False otherwise
+    """
+    tools = GodotExecutorTools()
+    return await tools.attach_script_to_node(node_path, script_path)
+
+
+@tool
+async def create_and_attach_script(node_path: str, script_content: str, script_name: Optional[str] = None) -> CreationResult:
+    """Create a new GDScript and attach it to a node.
+
+    Args:
+        node_path: Path to the target node
+        script_content: Content of the GDScript
+        script_name: Name for the script file (optional)
+
+    Returns:
+        CreationResult with operation outcome
+    """
+    tools = GodotExecutorTools()
+    return await tools.create_and_attach_script(node_path, script_content, script_name)
+
+
+@tool
+async def create_node_with_script(
+    node_type: str,
+    parent_path: str,
+    script_content: str,
+    node_name: Optional[str] = None,
+    properties: Optional[Dict[str, Any]] = None
+) -> CreationResult:
+    """Create a node with an attached script in one operation.
+
+    Args:
+        node_type: Type of node to create
+        parent_path: Path to parent node
+        script_content: Content of the script to attach
+        node_name: Name for the new node (optional)
+        properties: Initial properties for the node (optional)
+
+    Returns:
+        CreationResult with operation outcome
+    """
+    tools = GodotExecutorTools()
+    return await tools.create_node_with_script(node_type, parent_path, script_content, node_name, properties)
+
+
+@tool
+async def batch_create_nodes(creations: List[Dict[str, Any]]) -> List[CreationResult]:
+    """Create multiple nodes in a batch operation.
+
+    Args:
+        creations: List of node creation specifications
+
+    Returns:
+        List of CreationResult objects
+    """
+    tools = GodotExecutorTools()
+    return await tools.create_node_batch(creations)
+
+
+@tool
+async def batch_delete_nodes(node_paths: List[str]) -> List[bool]:
+    """Delete multiple nodes in a batch operation.
+
+    Args:
+        node_paths: List of node paths to delete
+
+    Returns:
+        List of bool indicating success for each deletion
+    """
+    tools = GodotExecutorTools()
+    return await tools.delete_node_batch(node_paths)
+
+
+@tool
+async def batch_modify_properties(modifications: List[Dict[str, Any]]) -> List[ModificationResult]:
+    """Modify multiple properties in a batch operation.
+
+    Args:
+        modifications: List of property modification specifications
+
+    Returns:
+        List of ModificationResult objects
+    """
+    tools = GodotExecutorTools()
+    return await tools.modify_properties_batch(modifications)
