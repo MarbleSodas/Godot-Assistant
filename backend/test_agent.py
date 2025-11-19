@@ -558,7 +558,13 @@ async def test_godot_tools_integration():
                     sig = inspect.signature(tool_func)
 
                     # Check if it's async
-                    if inspect.iscoroutinefunction(tool_func):
+                    is_async = inspect.iscoroutinefunction(tool_func)
+                    
+                    # Handle wrapped tools (DecoratedFunctionTool)
+                    if not is_async and hasattr(tool_func, '__wrapped__'):
+                        is_async = inspect.iscoroutinefunction(tool_func.__wrapped__)
+                    
+                    if is_async:
                         tools_with_correct_signatures += 1
                         print(f"  + {tool_name}: Proper async tool signature")
                     else:

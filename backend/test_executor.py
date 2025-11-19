@@ -199,6 +199,80 @@ def test_model_configuration():
         print(f"❌ Model configuration test failed: {e}")
 
 
+async def test_execute_with_fallback():
+    """Test execute_with_fallback method to ensure correct model usage."""
+    print("\n=== Testing Execute with Fallback ===")
+    
+    from agents.executor_agent import get_executor_agent
+    from unittest.mock import MagicMock, AsyncMock
+    
+    agent = get_executor_agent()
+    
+    # Mock the models
+    original_model = agent.model
+    original_fallback = agent.fallback_model
+    
+    try:
+        # 1. Test Primary Model Success
+        print("1. Testing Primary Model Success...")
+        mock_primary = AsyncMock()
+        mock_primary.complete.return_value = {"message": {"content": [{"text": "Primary success"}]}}
+        mock_primary.get_config.return_value = {"model_id": "primary-model"}
+        
+        agent.model = mock_primary
+        agent.fallback_model = None
+        
+        messages = [{"role": "user", "content": "test"}]
+        result = await agent.execute_with_fallback(messages)
+        
+        if result["message"]["content"][0]["text"] == "Primary success":
+            print("✅ Primary model used successfully")
+        else:
+            print(f"❌ Unexpected result: {result}")
+            
+        mock_primary.complete.assert_called_once()
+        
+        # 2. Test Fallback Mechanism
+        print("\n2. Testing Fallback Mechanism...")
+        # Make primary fail
+        mock_primary.complete.side_effect = Exception("Primary failed")
+        mock_primary.reset_mock()
+        
+        # Setup fallback
+        mock_fallback = AsyncMock()
+        mock_fallback.complete.return_value = {"message": {"content": [{"text": "Fallback success"}]}}
+        mock_fallback.get_config.return_value = {"model_id": "fallback-model"}
+        
+        # We need to mock _get_fallback_model or set it directly if it's already initialized
+        # Since _get_fallback_model instantiates a new model if None, we can inject our mock
+        agent.fallback_model = mock_fallback
+        
+        result = await agent.execute_with_fallback(messages)
+        
+        if result["message"]["content"][0]["text"] == "Fallback success":
+            print("✅ Fallback model used successfully after primary failure")
+        else:
+            print(f"❌ Unexpected result from fallback: {result}")
+            
+        # Verify calls
+        # Primary should have been called and failed
+        if mock_primary.complete.call_count == 1:
+            print("✅ Primary model was attempted")
+        else:
+            print(f"❌ Primary model call count wrong: {mock_primary.complete.call_count}")
+            
+        # Fallback should have been called
+        if mock_fallback.complete.call_count == 1:
+            print("✅ Fallback model was called")
+        else:
+            print(f"❌ Fallback model call count wrong: {mock_fallback.complete.call_count}")
+
+    finally:
+        # Restore original models
+        agent.model = original_model
+        agent.fallback_model = original_fallback
+
+
 if __name__ == "__main__":
     print("=== Executor Agent Test ===\n")
 
@@ -212,6 +286,9 @@ if __name__ == "__main__":
     # Test model configuration
     print("\n=== Model Configuration Test ===")
     test_model_configuration()
+    
+    # Test execute_with_fallback
+    asyncio.run(test_execute_with_fallback())
 
     print("\n=== Test Complete ===")
     print("\nExecutor agent works with structured data!")
