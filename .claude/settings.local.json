@@ -9,7 +9,14 @@
       "Bash(dir:*)",
       "Bash(where npx)",
       "Bash(npx:*)",
-      "Bash(uvx:*)"
+      "Bash(uvx:*)",
+      "Bash(find:*)",
+      "mcp__sequential-thinking__sequentialthinking",
+      "Bash(echo:*)",
+      "WebFetch(domain:openrouter.ai)",
+      "WebFetch(domain:strandsagents.com)",
+      "Bash(python3:*)",
+      "Bash(timeout:*)"
     ],
     "deny": [],
     "ask": []
