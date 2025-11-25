@@ -123,18 +123,18 @@ class TokenMetricsTracker:
         completion_tokens = usage.get("completion_tokens", 0)
         total_tokens = usage.get("total_tokens", 0)
         
-        # Calculate estimated cost
-        estimated_cost = ModelPricing.calculate_cost(
-            model_id,
-            prompt_tokens,
-            completion_tokens
-        )
-        
         # Extract actual cost if available from OpenRouter usage accounting
         actual_cost = usage.get("cost")
-        if actual_cost is None:
-             # Sometimes might be nested or named differently, but OpenRouter docs say 'cost' in usage.
-             pass
+        
+        if actual_cost is not None:
+            estimated_cost = float(actual_cost)
+        else:
+            # Calculate estimated cost
+            estimated_cost = ModelPricing.calculate_cost(
+                model_id,
+                prompt_tokens,
+                completion_tokens
+            )
         
         # Extract generation ID if available
         generation_id = response.get("id")
@@ -184,11 +184,17 @@ class TokenMetricsTracker:
                     completion_tokens = accumulated_usage.get('outputTokens', 0)
                     total_tokens = accumulated_usage.get('totalTokens', 0)
                     
-                    estimated_cost = ModelPricing.calculate_cost(
-                        model_id,
-                        prompt_tokens,
-                        completion_tokens
-                    )
+                    # Check for cost in accumulated_usage
+                    actual_cost = accumulated_usage.get('cost')
+                    
+                    if actual_cost is not None:
+                        estimated_cost = float(actual_cost)
+                    else:
+                        estimated_cost = ModelPricing.calculate_cost(
+                            model_id,
+                            prompt_tokens,
+                            completion_tokens
+                        )
                     
                     return {
                         "prompt_tokens": prompt_tokens,
@@ -205,11 +211,17 @@ class TokenMetricsTracker:
                 completion_tokens = usage.get('completion_tokens', 0)
                 total_tokens = usage.get('total_tokens', 0)
                 
-                estimated_cost = ModelPricing.calculate_cost(
-                    model_id,
-                    prompt_tokens,
-                    completion_tokens
-                )
+                # Check for cost in usage
+                actual_cost = usage.get('cost')
+                
+                if actual_cost is not None:
+                    estimated_cost = float(actual_cost)
+                else:
+                    estimated_cost = ModelPricing.calculate_cost(
+                        model_id,
+                        prompt_tokens,
+                        completion_tokens
+                    )
                 
                 return {
                     "prompt_tokens": prompt_tokens,
@@ -251,11 +263,17 @@ class TokenMetricsTracker:
                 completion_tokens = usage.get("outputTokens", 0)
                 total_tokens = usage.get("totalTokens", 0)
                 
-                estimated_cost = ModelPricing.calculate_cost(
-                    model_id,
-                    prompt_tokens,
-                    completion_tokens
-                )
+                # Check for cost in usage
+                actual_cost = usage.get("cost")
+                
+                if actual_cost is not None:
+                    estimated_cost = float(actual_cost)
+                else:
+                    estimated_cost = ModelPricing.calculate_cost(
+                        model_id,
+                        prompt_tokens,
+                        completion_tokens
+                    )
                 
                 return {
                     "prompt_tokens": prompt_tokens,

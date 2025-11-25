@@ -65,6 +65,32 @@ class TestTokenMetricsTracker:
         assert metrics["stop_reason"] == "stop"
         assert metrics["estimated_cost"] > 0
 
+    def test_extract_metrics_from_response_with_cost(self):
+        """Test extracting metrics from OpenRouter response with provided cost."""
+        tracker = TokenMetricsTracker()
+        
+        response = {
+            "id": "gen_123",
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+                "cost": 0.05  # Explicit cost
+            },
+            "choices": [{
+                "finish_reason": "stop"
+            }]
+        }
+        
+        metrics = tracker.extract_metrics_from_response(response, "openai/gpt-4-turbo")
+        
+        assert metrics["prompt_tokens"] == 100
+        assert metrics["completion_tokens"] == 50
+        assert metrics["total_tokens"] == 150
+        assert metrics["estimated_cost"] == 0.05
+        assert metrics["actual_cost"] == 0.05
+
+
 
 @pytest.mark.asyncio
 class TestDatabaseManager:

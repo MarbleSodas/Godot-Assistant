@@ -8,6 +8,7 @@ to generate execution plans for other agents.
 import logging
 import uuid
 import warnings
+import os
 from datetime import datetime
 from typing import Optional, AsyncIterable, Dict, Any
 
@@ -17,6 +18,7 @@ warnings.filterwarnings("ignore", message="Graph without execution limits may ru
 from strands import Agent
 from strands.agent.conversation_manager import SlidingWindowConversationManager
 
+from context.engine import ContextEngine
 from .models import OpenRouterModel
 from .config import AgentConfig
 from .metrics_tracker import TokenMetricsTracker
@@ -128,6 +130,11 @@ class PlanningAgent:
                 self.model = OpenRouterModel(api_key_value, **model_config)
             else:
                 raise
+
+        # Initialize Context Engine
+        # Repo root is 3 levels up: backend/agents/planning_agent.py -> backend/agents -> backend -> Root
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        self.context_engine = ContextEngine(repo_root)
 
         # Define base tools for the agent - limited to safe operations
         self.tools = [
@@ -304,6 +311,31 @@ class PlanningAgent:
                     logger.error(error_msg)
                     raise
 
+    def _prepare_agent_with_context(self, prompt: str):
+        """
+        Inject dynamic context into the agent's system prompt.
+        """
+        try:
+            # Get context from engine
+            context = self.context_engine.get_context_for_prompt(prompt)
+            
+            # Combine with base prompt
+            base_prompt = AgentConfig.PLANNING_AGENT_SYSTEM_PROMPT
+            enhanced_prompt = f"{base_prompt}\n\n{context}"
+            
+            # Recreate agent with new system prompt but same history
+            self.agent = Agent(
+                model=self.model,
+                tools=self.tools,
+                system_prompt=enhanced_prompt,
+                conversation_manager=self.conversation_manager
+            )
+            # logger.info("Agent context updated with dynamic codebase map")
+            
+        except Exception as e:
+            logger.error(f"Failed to inject context: {e}")
+            # Continue with existing agent if context fails
+
     def plan(self, prompt: str) -> str:
         """
         Generate a plan synchronously.
@@ -315,6 +347,9 @@ class PlanningAgent:
             Generated plan as a string
         """
         try:
+            # Inject context
+            self._prepare_agent_with_context(prompt)
+
             result = self.agent(prompt)
 
             # Extract text from result
@@ -358,6 +393,9 @@ class PlanningAgent:
         try:
             # Ensure MCP tools are initialized
             await self._ensure_mcp_initialized()
+
+            # Inject context
+            self._prepare_agent_with_context(prompt)
 
             logger.info("Using Strands Agent Loop for async planning")
 
@@ -493,6 +531,9 @@ class PlanningAgent:
 
             # Ensure MCP tools are initialized
             await self._ensure_mcp_initialized()
+
+            # Inject context
+            self._prepare_agent_with_context(prompt)
 
             print(f"[PLAN] Starting Strands Agent Loop...")
             logger.info(f"[PLAN] Starting Strands Agent Loop for prompt: {prompt[:100]}...")

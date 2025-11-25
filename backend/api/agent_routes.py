@@ -10,12 +10,13 @@ Provides endpoints for interacting with the planning agent:
 import asyncio
 import json
 import logging
-from typing import Optional
+from typing import Optional, AsyncIterable
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from agents import get_planning_agent, close_planning_agent
+from agents.db import ProjectDB
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +207,51 @@ async def reset_conversation():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class UpdateConfigRequest(BaseModel):
+    """Request model for updating agent configuration."""
+    planning_model: Optional[str] = Field(None, description="Model ID for planning agent")
+    executor_model: Optional[str] = Field(None, description="Model ID for executor agent")
+    openrouter_api_key: Optional[str] = Field(None, description="OpenRouter API key")
+
+
+@router.post("/config")
+async def update_agent_config(request: UpdateConfigRequest):
+    """
+    Update agent configuration.
+    
+    Args:
+        request: Configuration updates
+        
+    Returns:
+        Updated configuration
+    """
+    try:
+        agent = get_planning_agent()
+        
+        # Update configuration
+        agent.model.update_config(
+            planning_model=request.planning_model,
+            executor_model=request.executor_model,
+            api_key=request.openrouter_api_key
+        )
+        
+        # Get updated config
+        model_config = agent.model.get_config()
+        
+        return {
+            "status": "success",
+            "message": "Configuration updated successfully",
+            "config": {
+                "model_id": model_config.get("planning_model", "unknown"),
+                "model_config": model_config
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error updating config: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/config")
 async def get_agent_config():
     """
@@ -224,7 +270,7 @@ async def get_agent_config():
         return {
             "status": "success",
             "config": {
-                "model_id": model_config.get("model_id", "unknown"),
+                "model_id": model_config.get("planning_model", "unknown"),
                 "model_config": model_config,
                 "tools": [
                     getattr(tool, '__name__',
@@ -283,7 +329,7 @@ async def create_session(request: SessionRequest):
 
 
 @router.get("/sessions", response_model=dict)
-async def list_sessions():
+async def list_sessions(path: Optional[str] = Query(None)):
     """
     List all available sessions.
     
@@ -291,6 +337,23 @@ async def list_sessions():
         List of sessions
     """
     try:
+        if path:
+            try:
+                db = ProjectDB(path)
+                sessions = db.get_all_sessions()
+                return {
+                    "status": "success",
+                    "sessions": sessions
+                }
+            except Exception as e:
+                logger.error(f"Error listing sessions from ProjectDB: {e}")
+                # Fallback or re-raise? 
+                # If path provided but failed, maybe return empty or error?
+                # Let's fall back to manager if it might have info? 
+                # But manager likely doesn't know about path-scoped DB sessions unless synced.
+                # Let's continue to fallback for backward compatibility if DB fails?
+                pass
+
         from agents.multi_agent_manager import get_multi_agent_manager
         manager = get_multi_agent_manager()
         
@@ -306,17 +369,33 @@ async def list_sessions():
 
 
 @router.get("/sessions/{session_id}", response_model=dict)
-async def get_session(session_id: str):
+async def get_session(session_id: str, path: Optional[str] = Query(None)):
     """
     Get session details.
     
     Args:
         session_id: Session ID
+        path: Optional project path to look up in ProjectDB
         
     Returns:
         Session details
     """
     try:
+        if path:
+            try:
+                db = ProjectDB(path)
+                session = db.get_session(session_id)
+                if session:
+                    # Get session metrics too
+                    metrics = db.get_session_metrics(session_id)
+                    session["metrics"] = metrics
+                    return {
+                        "status": "success",
+                        "session": session
+                    }
+            except Exception as e:
+                logger.error(f"Error getting session from ProjectDB: {e}")
+
         from agents.multi_agent_manager import get_multi_agent_manager
         manager = get_multi_agent_manager()
         
@@ -335,23 +414,110 @@ async def get_session(session_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.delete("/sessions/{session_id}", response_model=dict)
-async def delete_session(session_id: str):
+@router.post("/sessions/{session_id}/restore", response_model=dict)
+async def restore_session(session_id: str, path: str = Query(...)):
     """
-    Delete a session.
+    Restore agent state from history.
     
     Args:
         session_id: Session ID
+        path: Project path
         
     Returns:
         Status message
     """
     try:
+        # Initialize agent with project path and restore session
+        from agents.executor_agent import get_executor_agent
+        agent = get_executor_agent()
+        
+        agent.set_project_path(path)
+        agent.restore_session(session_id)
+        
+        return {
+            "status": "success",
+            "message": f"Session {session_id} restored"
+        }
+    except Exception as e:
+        logger.error(f"Error restoring session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/metrics/project", response_model=dict)
+async def get_project_metrics(path: str = Query(...)):
+    """
+    Get aggregated metrics for the project.
+    
+    Args:
+        path: Project path
+        
+    Returns:
+        Project metrics
+    """
+    try:
+        db = ProjectDB(path)
+        metrics = db.get_project_metrics()
+        return {
+            "status": "success",
+            "metrics": metrics
+        }
+    except Exception as e:
+        logger.error(f"Error getting project metrics: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/metrics/session/{session_id}", response_model=dict)
+async def get_session_metrics_endpoint(session_id: str, path: str = Query(...)):
+    """
+    Get metrics for a specific session.
+    
+    Args:
+        session_id: Session ID
+        path: Project path
+        
+    Returns:
+        Session metrics
+    """
+    try:
+        db = ProjectDB(path)
+        metrics = db.get_session_metrics(session_id)
+        return {
+            "status": "success",
+            "metrics": metrics
+        }
+    except Exception as e:
+        logger.error(f"Error getting session metrics: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/sessions/{session_id}", response_model=dict)
+async def delete_session(session_id: str, path: Optional[str] = Query(None)):
+    """
+    Delete a session.
+    
+    Args:
+        session_id: Session ID
+        path: Optional project path
+        
+    Returns:
+        Status message
+    """
+    try:
+        project_db_deleted = False
+        if path:
+            try:
+                db = ProjectDB(path)
+                db.delete_session(session_id)
+                project_db_deleted = True
+            except Exception as e:
+                logger.error(f"Error deleting from ProjectDB: {e}")
+
         from agents.multi_agent_manager import get_multi_agent_manager
         manager = get_multi_agent_manager()
         
-        success = manager.delete_session(session_id)
-        if not success:
+        manager_deleted = manager.delete_session(session_id)
+        
+        if not manager_deleted and not project_db_deleted:
             raise HTTPException(status_code=404, detail="Session not found or could not be deleted")
             
         return {
@@ -366,13 +532,14 @@ async def delete_session(session_id: str):
 
 
 @router.post("/sessions/{session_id}/chat", response_model=dict)
-async def chat_session(session_id: str, request: ChatRequest):
+async def chat_session(session_id: str, request: ChatRequest, path: Optional[str] = Query(None)):
     """
     Send a message to a session.
     
     Args:
         session_id: Session ID
         request: ChatRequest with message
+        path: Optional project path
         
     Returns:
         Agent response
@@ -383,12 +550,12 @@ async def chat_session(session_id: str, request: ChatRequest):
         
         # Auto-create session if it doesn't exist (lazy creation)
         if not manager.get_session(session_id):
-            logger.info(f"Auto-creating session {session_id} with title: {chat_request.message[:50]}...")
-            manager.create_session(session_id, title=chat_request.message)
+            logger.info(f"Auto-creating session {session_id} with title: {request.message[:50]}...")
+            manager.create_session(session_id, title=request.message)
         
         # Process message
         # Note: This might take time, so in a real app we might want streaming or background tasks
-        result = await manager.process_message(session_id, request.message, mode=request.mode)
+        result = await manager.process_message(session_id, request.message, mode=request.mode, project_path=path)
         
         # Format result
         response_text = str(result)
@@ -443,7 +610,8 @@ async def stop_session(session_id: str):
 async def chat_session_stream(
     session_id: str,
     chat_request: ChatRequest,
-    request: Request
+    request: Request,
+    path: Optional[str] = Query(None)
 ):
     """
     Send a message to a session and stream the response.
@@ -452,6 +620,7 @@ async def chat_session_stream(
         session_id: Session ID
         chat_request: ChatRequest with message
         request: FastAPI Request object for disconnection detection
+        path: Optional project path
 
     Returns:
         StreamingResponse with Server-Sent Events
@@ -504,7 +673,7 @@ async def chat_session_stream(
         async def event_generator():
             """Generate Server-Sent Events from agent stream."""
             try:
-                async for event in manager.process_message_stream(session_id, chat_request.message, mode=chat_request.mode):
+                async for event in manager.process_message_stream(session_id, chat_request.message, mode=chat_request.mode, project_path=path):
                     # Check if client has disconnected
                     if await request.is_disconnected():
                         logger.info(f"Client disconnected for session {session_id}, stopping stream")

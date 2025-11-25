@@ -4,6 +4,7 @@ Event utilities for transforming Strands events to frontend-compatible format.
 
 import logging
 from typing import Any, Dict, Optional, List, Union
+from agents.metrics_tracker import ModelPricing
 
 logger = logging.getLogger(__name__)
 
@@ -142,8 +143,14 @@ def transform_strands_event(event: Any) -> Optional[Dict[str, Any]]:
                     "tool_name": tool_use.get("name"),
                     "tool_input": tool_use.get("input", {})
                 }
-        # Message start/stop events - we can ignore these
-        elif "messageStart" in inner_event or "messageStop" in inner_event:
+        # Message start/stop events
+        elif "messageStop" in inner_event:
+             # Check for usage in the inner event
+             # Note: The structure might vary, but let's try to find usage
+             # Usually usage is a top-level field in the message object, but in streaming 
+             # it comes in the message_stop event.
+             pass
+        elif "messageStart" in inner_event:
             return None
         else:
             # logger.debug(f"Unhandled inner event: {inner_event}")
@@ -176,8 +183,102 @@ def transform_strands_event(event: Any) -> Optional[Dict[str, Any]]:
     elif "contentBlockStop" in event:
         return None
         
-    elif "messageStart" in event or "messageStop" in event:
+    elif "messageStop" in event:
+        # Message stop event - often contains usage metrics from OpenRouter adapter
+        stop_event = event["messageStop"]
+
+        # Extract usage if present (now provided by OpenRouterModel)
+        usage = stop_event.get("usage", {})
+        if usage:
+            input_tokens = usage.get("input_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0)
+            total_tokens = usage.get("total_tokens", input_tokens + output_tokens)
+
+            # Get actual cost if available from OpenRouter
+            actual_cost = usage.get("actual_cost")
+
+            # Get model_id from event context if available
+            # Check inside stop_event first (in case it was injected there)
+            model_id = stop_event.get("model_id")
+            if not model_id:
+                model_id = event.get("model_id", "anthropic/claude-3.5-sonnet")
+
+            # Use actual cost if available, otherwise fallback to calculation
+            if actual_cost is not None:
+                estimated_cost = float(actual_cost)
+            else:
+                # Calculate estimated cost as fallback using ModelPricing
+                estimated_cost = ModelPricing.calculate_cost(
+                    model_id,
+                    input_tokens,
+                    output_tokens
+                )
+
+            # Prepare metrics response with both actual and estimated cost
+            metrics_data = {
+                "total_tokens": total_tokens,
+                "estimated_cost": estimated_cost,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "model_id": model_id
+            }
+
+            return {
+                "type": "metrics",
+                "data": {
+                    "metrics": metrics_data
+                }
+            }
+
+    elif "messageStart" in event:
         return None
+
+    elif "type" in event and event["type"] == "message_stop":
+         # Alternative message stop format (fallback handler)
+         if "amazon-bedrock-invocationMetrics" in event:
+             # Bedrock format
+             pass
+
+         # Check for usage
+         usage = event.get("usage", {})
+         if usage:
+             input_tokens = usage.get("input_tokens", 0)
+             output_tokens = usage.get("output_tokens", 0)
+             total_tokens = input_tokens + output_tokens
+
+             # Get actual cost if available
+             actual_cost = usage.get("actual_cost")
+
+             # Get model_id from event context
+             model_id = event.get("model_id", "anthropic/claude-3.5-sonnet")
+             if "model_id" not in event:
+                 logger.warning("No model_id in message_stop event, using default for cost calculation")
+
+             # Use actual cost if available, otherwise fallback to calculation
+             if actual_cost is not None:
+                 estimated_cost = float(actual_cost)
+             else:
+                 # Use ModelPricing class for accurate cost calculation
+                 estimated_cost = ModelPricing.calculate_cost(
+                     model_id,
+                     input_tokens,
+                     output_tokens
+                 )
+
+             metrics_data = {
+                 "total_tokens": total_tokens,
+                 "estimated_cost": estimated_cost,
+                 "input_tokens": input_tokens,
+                 "output_tokens": output_tokens,
+                 "model_id": model_id
+             }
+
+             return {
+                 "type": "metrics",
+                 "data": {
+                     "metrics": metrics_data
+                 }
+             }
 
     elif "data" in event:
         # Skip Strands metadata events (they have agent, event_loop_cycle_id, etc.)

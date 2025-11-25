@@ -1014,7 +1014,7 @@ func _capture_game_screenshot(command: Dictionary) -> Dictionary:
 	file.close()
 
 	# Return relative path from project root
-	var relative_path = filepath.replace(project_path, "").trim_prefix("/").trim_prefix("\થી")
+	var relative_path = filepath.replace(project_path, "").trim_prefix("/").trim_prefix("\\")
 
 	return {
 		"status": "success",
@@ -1106,7 +1106,7 @@ func _extract_basic_properties(node: Node) -> Dictionary:
 		if _has_property(node, "rotation_degrees"): props["rotation_degrees"] = node.get("rotation_degrees")
 		if _has_property(node, "scale"): props["scale"] = node.get("scale")
 		if _has_property(node, "visible"): props["visible"] = node.get("visible")
-elif node is Control:
+	elif node is Control:
 		if _has_property(node, "position"): props["position"] = node.get("position")
 		if _has_property(node, "size"): props["size"] = node.get("size")
 		for an in ["anchor_left", "anchor_top", "anchor_right", "anchor_bottom"]:

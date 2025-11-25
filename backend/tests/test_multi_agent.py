@@ -62,6 +62,12 @@ def mock_agents():
         mock_planner.return_value = planner_instance
         
         executor_instance = MagicMock()
+        executor_mock_agent = MagicMock(spec=MockAgent)
+        executor_mock_agent.state.get.return_value = {}
+        executor_mock_agent._session_manager = None
+        executor_mock_agent.stream_async = mock_stream_async
+        executor_instance.agent = executor_mock_agent
+        
         mock_executor.return_value = executor_instance
         
         yield mock_planner, mock_executor
@@ -135,7 +141,21 @@ async def test_process_message(temp_storage_dir, mock_agents):
     
     manager.create_session(session_id)
     
+    # Update mock_agents stream_async to yield a text event
+    _, mock_executor = mock_agents
+    executor_instance = mock_executor.return_value
+    
+    async def mock_text_stream(*args, **kwargs):
+        yield {
+            "contentBlockDelta": {
+                "delta": {"text": "Agent response"}
+            }
+        }
+        yield {"result": MagicMock(stop_reason="end_turn")}
+
+    executor_instance.agent.stream_async = mock_text_stream
+    
     # Process message
-    response = await manager.process_message(session_id, "Hello")
+    response = await manager.process_message(session_id, "Hello", mode="fast")
     
     assert response == "Agent response"

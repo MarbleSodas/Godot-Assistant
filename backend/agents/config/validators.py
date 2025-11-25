@@ -26,9 +26,10 @@ class ConfigValidator:
         errors = []
         
         # Check OpenRouter API Key
-        if not model_config.OPENROUTER_API_KEY:
-            errors.append("OPENROUTER_API_KEY is not set. Please set it in .env file.")
-        elif not model_config.OPENROUTER_API_KEY.startswith("sk-or-v1-"):
+        api_key = model_config.get_openrouter_config().get("api_key")
+        if not api_key:
+            errors.append("OPENROUTER_API_KEY is not set. Please set it in .env file or configuration.")
+        elif not api_key.startswith("sk-or-v1-"):
             warnings.append("OPENROUTER_API_KEY format looks incorrect. Should start with 'sk-or-v1-'.")
         
         # Validate model configuration

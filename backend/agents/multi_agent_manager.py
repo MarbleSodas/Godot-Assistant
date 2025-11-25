@@ -15,7 +15,7 @@ import warnings
 import json
 import re
 from datetime import datetime
-from typing import Dict, Any, Optional, List, Union
+from typing import Dict, Any, Optional, List, Union, AsyncIterable
 
 # Suppress LangGraph warning before importing strands
 warnings.filterwarnings("ignore", message="Graph without execution limits may run indefinitely if cycles exist")
@@ -27,6 +27,7 @@ from strands.session.file_session_manager import FileSessionManager
 from .planning_agent import get_planning_agent
 from .executor_agent import get_executor_agent
 from .config import AgentConfig
+from .db import ProjectDB
 
 logger = logging.getLogger(__name__)
 
@@ -254,14 +255,14 @@ class MultiAgentManager:
             "created_at": datetime.now().isoformat()
         }
 
-    async def process_message(self, session_id: str, message: str, project_id: Optional[str] = None, mode: str = "planning") -> Any:
+    async def process_message(self, session_id: str, message: str, project_path: Optional[str] = None, mode: str = "planning") -> Any:
         """
         Process a message in a session (non-streaming).
 
         Args:
             session_id: Session ID
             message: User message
-            project_id: Optional project ID for metrics tracking
+            project_path: Optional project path for context
             mode: "planning" or "fast"
 
         Returns:
@@ -269,7 +270,7 @@ class MultiAgentManager:
         """
         # We'll implement this by consuming the stream to ensure consistent logic
         response_text = ""
-        async for event in self.process_message_stream(session_id, message, project_id, mode):
+        async for event in self.process_message_stream(session_id, message, mode=mode, project_path=project_path):
             if event["type"] == "data" and "text" in event["data"]:
                 response_text += event["data"]["text"]
             elif event["type"] == "error":
@@ -277,37 +278,58 @@ class MultiAgentManager:
         
         return response_text
 
-    async def process_message_stream(self, session_id: str, message: str, project_id: Optional[str] = None, mode: str = "planning"):
+    async def process_message_stream(
+        self,
+        session_id: str,
+        message: str,
+        mode: str = "planning",
+        project_path: Optional[str] = None
+    ) -> AsyncIterable[Dict[str, Any]]:
         """
-        Process a message in a session and stream the response.
+        Process a message in a session (streaming).
 
         Args:
             session_id: Session ID
             message: User message
-            project_id: Optional project ID for metrics tracking
-            mode: "planning" or "fast"
+            mode: Execution mode ("planning" or "fast")
+            project_path: Optional project path for context
 
         Yields:
-            Dict with event type and data
+            Stream events
         """
-        # Ensure session exists/is loaded
         if session_id not in self._active_graphs:
-            if self.get_session(session_id):
-                self.create_session(session_id)  # Re-load
-            else:
-                raise ValueError(f"Session {session_id} not found")
+            self._active_graphs[session_id] = self._create_graphs(session_id)
 
-        # Register current task
+        # Setup executor agent with context
+        try:
+            executor_agent = get_executor_agent()
+            if project_path:
+                executor_agent.set_project_path(project_path)
+            # Ensure session context is set for metrics
+            executor_agent.start_session(session_id)
+        except Exception as e:
+            logger.warning(f"Failed to setup executor context: {e}")
+
+        # Cancel existing task if any
+        if session_id in self._active_tasks:
+            task = self._active_tasks[session_id]
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            del self._active_tasks[session_id]
+        
+        # Create new task tracking
         import asyncio
         current_task = asyncio.current_task()
         if current_task:
             self._active_tasks[session_id] = current_task
 
+        graphs = self._active_graphs[session_id]
+        
         try:
-            logger.info(f"Processing message stream in session {session_id} with mode {mode}")
-            
-            graphs = self._active_graphs[session_id]
-            
             # Import shared event utility
             from .event_utils import transform_strands_event
             
@@ -501,7 +523,7 @@ class MultiAgentManager:
                     }
 
             # Track session-level metrics if enabled
-            self._track_metrics(session_id, project_id)
+            self._track_metrics(session_id, project_path)
 
         except asyncio.CancelledError:
             logger.info(f"Task cancelled for session {session_id}")

@@ -2,7 +2,7 @@
 OpenRouter Custom Model Provider for Strands Agents
 
 This module provides a custom model provider that integrates the official OpenRouter Python SDK
-with the Strands Agents framework, enabling streaming and tool calling.
+with the Strands Agents framework, enabling streaming, tool calling, and usage tracking.
 """
 
 import json
@@ -10,7 +10,6 @@ import logging
 import httpx
 from typing import AsyncIterable, Optional, Any, Dict, List, Type, TypeVar, Union, AsyncGenerator, TypedDict, cast
 from typing_extensions import Unpack
-import re
 
 from pydantic import BaseModel
 from strands.models import Model
@@ -20,9 +19,10 @@ from strands.types.tools import ToolSpec
 
 from openrouter import OpenRouter
 from openrouter import components
-from openrouter.utils import eventstreaming
 
 logger = logging.getLogger(__name__)
+metric_logger = logging.getLogger("metrics")
+metric_logger.setLevel(logging.INFO)
 
 # TypeVar for structured output
 T = TypeVar('T', bound=BaseModel)
@@ -46,12 +46,14 @@ class OpenRouterModel(Model):
     Supports:
     - Streaming responses
     - Tool calling
+    - Usage tracking (Metrics)
     - Error handling
     """
 
     def __init__(
         self,
         api_key: str,
+        metrics_callback: Optional[Any] = None,
         **model_config: Unpack[ModelConfig]
     ) -> None:
         """
@@ -59,12 +61,14 @@ class OpenRouterModel(Model):
 
         Args:
             api_key: OpenRouter API key
+            metrics_callback: Optional callback function(cost, tokens, model_name)
             **model_config: Model configuration
         """
         if not api_key or not api_key.strip():
             raise ValueError("OpenRouter API key cannot be empty.")
         
         self.api_key = api_key.strip()
+        self.metrics_callback = metrics_callback
 
         # Store configuration with defaults
         self._config: ModelConfig = {
@@ -90,6 +94,7 @@ class OpenRouterModel(Model):
         )
 
         # Initialize OpenRouter SDK Client
+        # Explicitly pass security object to ensure it is picked up
         self._client = OpenRouter(
             api_key=self.api_key,
             async_client=self._async_http_client
@@ -139,10 +144,6 @@ class OpenRouterModel(Model):
                 text_parts = []
                 tool_calls = []
                 
-                # Keep track of tool results to add as separate messages if needed
-                # But Strands usually puts tool results in "user" or "tool" role messages.
-                # Here we are processing a single message's content list.
-                
                 for block in content:
                     if "text" in block:
                         text_parts.append(block["text"])
@@ -157,9 +158,6 @@ class OpenRouterModel(Model):
                             }
                         })
                     elif "toolResult" in block:
-                        # Tool result is a separate message in OpenAI format usually
-                        # If we encounter it here, it means Strands grouped it.
-                        # We should probably handle it by appending a tool message to sdk_messages
                         tool_result = block["toolResult"]
                         sdk_messages.append({
                             "role": "tool",
@@ -213,15 +211,10 @@ class OpenRouterModel(Model):
                     for spec in tool_specs
                 ]
 
+            # Prepare stream options for usage tracking
+            stream_opts = components.ChatStreamOptions(include_usage=True)
+
             # Call SDK
-            # Note: extra_body params can be passed via specific SDK args if available or 
-            # we might need to check if the SDK supports extra_body passthrough.
-            # The `send_async` method in generated SDK often has specific named parameters.
-            
-            params = self._config.get("params", {})
-            
-            # Using the SDK's send_async method
-            # We cast to Any to avoid strict type checking issues with the generated SDK types vs dicts
             stream_response = await self._client.chat.send_async(
                 model=self._config.get("model_id"),
                 messages=cast(Any, sdk_messages),
@@ -230,7 +223,7 @@ class OpenRouterModel(Model):
                 max_tokens=self._config.get("max_tokens"),
                 tools=cast(Any, tools) if tools else None,
                 tool_choice=tool_choice if tools and tool_choice else ("auto" if tools else None),
-                extra_body={"usage": {"include": True}}
+                stream_options=stream_opts
             )
             
             # Process the stream
@@ -253,17 +246,52 @@ class OpenRouterModel(Model):
         message_started = False
         content_block_started = False
         final_finish_reason = "end_turn"
-        
+
+        # Track usage data from OpenRouter
+        usage_data = {}
+
         # Track active tool state
-        # Key: index. Value: {id: str, name: str, has_started: bool}
         active_tools = {}
         
         async for chunk in stream:
-            # Chunk is ChatStreamingResponseChunk
-            
-            # DEBUG LOGGING
-            if chunk.choices and chunk.choices[0].delta.tool_calls:
-                 logger.info(f"🛠️ SDK TOOL CALL CHUNK: {chunk.choices[0].delta.tool_calls}")
+            # Check for usage data in chunk
+            if chunk.usage:
+                usage = chunk.usage
+                prompt_tokens = usage.prompt_tokens
+                completion_tokens = usage.completion_tokens
+                total_tokens = usage.total_tokens
+
+                # Extract actual cost from OpenRouter (in credits)
+                actual_cost = getattr(usage, 'cost', None)
+
+                # Store usage data for messageStop event
+                usage_data = {
+                    "input_tokens": prompt_tokens,
+                    "output_tokens": completion_tokens,
+                    "total_tokens": total_tokens
+                }
+
+                # Include actual cost if available
+                if actual_cost is not None:
+                    usage_data["actual_cost"] = actual_cost
+
+                # Invoke metrics callback if provided
+                if self.metrics_callback:
+                    try:
+                        self.metrics_callback(
+                            cost=actual_cost if actual_cost is not None else 0.0,
+                            tokens=total_tokens,
+                            model_name=self._config.get("model_id", "unknown")
+                        )
+                    except Exception as e:
+                        logger.error(f"Error in metrics callback: {e}")
+
+                # Log metrics including actual cost when available
+                cost_str = f"Cost: ${actual_cost:.6f}" if actual_cost is not None else "Cost: N/A"
+                metric_logger.info(
+                    f"LLM_CALL | Model: {self._config.get('model_id')} | "
+                    f"Tokens: {total_tokens} (P:{prompt_tokens}, C:{completion_tokens}) | {cost_str}"
+                )
             
             if not chunk.choices:
                 continue
@@ -276,10 +304,7 @@ class OpenRouterModel(Model):
                 yield {"messageStart": {"role": "assistant"}}
                 message_started = True
             
-            # Capture finish reason
             if finish_reason:
-                logger.info(f"SDK Finish Reason: {finish_reason}")
-                # Map OpenAI/OpenRouter reasons to Strands reasons
                 if finish_reason == "tool_calls":
                     final_finish_reason = "tool_use"
                 elif finish_reason == "stop":
@@ -301,7 +326,6 @@ class OpenRouterModel(Model):
 
             # Handle tool calls
             if delta.tool_calls:
-                # If we were in a text block, close it
                 if content_block_started:
                     yield {"contentBlockStop": {}}
                     content_block_started = False
@@ -314,15 +338,13 @@ class OpenRouterModel(Model):
                     
                     state = active_tools[idx]
                     
-                    # Update state
                     if tool_call.id:
                         state["id"] = tool_call.id
                     if tool_call.function and tool_call.function.name:
                         state["name"] = tool_call.function.name
                     
-                    # If we have Name and ID, start block
                     if not state["has_started"] and state["name"] and state["id"]:
-                        event = {
+                        yield {
                             "contentBlockStart": {
                                 "start": {
                                     "toolUse": {
@@ -332,26 +354,18 @@ class OpenRouterModel(Model):
                                 }
                             }
                         }
-                        logger.info(f"Yielding Tool Start: {event}")
-                        yield event
                         state["has_started"] = True
                     
-                    # Yield arguments delta if started
-                    # We only check if arguments are present (not None)
-                    if state["has_started"] and tool_call.function and tool_call.function.arguments is not None:
-                        # Only yield if there is actual content
-                        if tool_call.function.arguments:
-                            event = {
-                                "contentBlockDelta": {
-                                    "delta": {
-                                        "toolUse": {
-                                            "input": tool_call.function.arguments
-                                        }
+                    if state["has_started"] and tool_call.function and tool_call.function.arguments:
+                        yield {
+                            "contentBlockDelta": {
+                                "delta": {
+                                    "toolUse": {
+                                        "input": tool_call.function.arguments
                                     }
                                 }
                             }
-                            logger.info(f"Yielding Tool Args: {event}")
-                            yield event
+                        }
 
             # Handle finish
             if finish_reason:
@@ -359,24 +373,26 @@ class OpenRouterModel(Model):
                     yield {"contentBlockStop": {}}
                     content_block_started = False
                 
-                # Close any open tool blocks
                 for idx, state in active_tools.items():
                     if state["has_started"]:
-                        event = {"contentBlockStop": {}}
-                        logger.info(f"Yielding Tool Stop (finish_reason): {event}")
-                        yield event
+                        yield {"contentBlockStop": {}}
                         state["has_started"] = False
 
-        # Ensure we close any lingering blocks if finish_reason wasn't sent (e.g. error)
-        if content_block_started:
-             yield {"contentBlockStop": {}}
-        for idx, state in active_tools.items():
-             if state["has_started"]:
-                 event = {"contentBlockStop": {}}
-                 logger.info(f"Yielding Tool Stop (cleanup): {event}")
-                 yield event
-
-        yield {"messageStop": {"stopReason": final_finish_reason}}
+        # Include usage data in messageStop event if available
+        if usage_data:
+            yield {
+                "messageStop": {
+                    "stopReason": final_finish_reason, 
+                    "usage": usage_data,
+                    "model_id": self._config.get("model_id")
+                },
+                "model_id": self._config.get("model_id")  # Top-level as well for easy access
+            }
+        else:
+            yield {
+                "messageStop": {"stopReason": final_finish_reason},
+                "model_id": self._config.get("model_id")
+            }
 
     async def complete(
         self,
@@ -389,59 +405,83 @@ class OpenRouterModel(Model):
         **kwargs: Any
     ) -> Dict[str, Any]:
         """
-        Get a complete (non-streaming) chat completion.
+        Get a complete chat completion using streaming (to support usage metrics via SDK).
         """
-        # Convert messages
-        sdk_messages = self._convert_messages_to_sdk_format(messages)
-        if system_prompt:
-            sdk_messages.insert(0, {"role": "system", "content": system_prompt})
+        # We reuse the stream method to ensure we get usage data which is supported
+        # in the SDK via stream_options. The non-streaming method doesn't support
+        # 'usage' param in this SDK version without 'extra_body'.
+        
+        full_content = []
+        current_text = ""
+        tool_calls = {} # Map ID -> {name, arguments_str}
+        stop_reason = "end_turn"
+        final_usage = {} # Track usage from messageStop event
 
-        tools = None
-        if tool_specs:
-             tools = [self._convert_tool_to_sdk_format(spec) for spec in tool_specs]
-
-        response = await self._client.chat.send_async(
-            model=self._config.get("model_id"),
-            messages=cast(Any, sdk_messages),
-            stream=False,
-            temperature=self._config.get("temperature"),
-            max_tokens=self._config.get("max_tokens"),
-            tools=cast(Any, tools) if tools else None,
-            tool_choice=tool_choice if tools and tool_choice else ("auto" if tools else None),
-            extra_body={"usage": {"include": True}}
-        )
-        
-        # Convert response to Strands format
-        # Response is components.ChatResponse
-        # We need to convert it to dict
-        
-        # Using basic conversion logic
-        choice = response.choices[0]
-        message = choice.message
-        
-        content_blocks = []
-        if message.content:
-            content_blocks.append({"text": message.content})
+        async for event in self.stream(
+            messages, 
+            tool_specs, 
+            system_prompt, 
+            tool_choice=tool_choice, 
+            system_prompt_content=system_prompt_content, 
+            **kwargs
+        ):
+            if "contentBlockDelta" in event:
+                delta = event["contentBlockDelta"]["delta"]
+                if "text" in delta:
+                    current_text += delta["text"]
+                elif "toolUse" in delta:
+                    # Strands streaming doesn't provide ID in delta usually, 
+                    # it assumes we are in a block.
+                    # But we need to reconstruct the full tool call.
+                    # We'll rely on the fact that Strands emits 'contentBlockStart' with ID.
+                    pass
             
-        if message.tool_calls:
-            for tc in message.tool_calls:
-                content_blocks.append({
-                    "toolUse": {
-                        "toolUseId": tc.id,
-                        "name": tc.function.name,
-                        "input": json.loads(tc.function.arguments)
-                    }
-                })
-                
+            elif "contentBlockStart" in event:
+                start = event["contentBlockStart"]["start"]
+                if "toolUse" in start:
+                    t_id = start["toolUse"]["toolUseId"]
+                    t_name = start["toolUse"]["name"]
+                    tool_calls[t_id] = {"name": t_name, "arguments": ""}
+                    # Set current tool ID for deltas (simplified logic)
+                    self._current_tool_id = t_id
+            
+            elif "contentBlockDelta" in event:
+                delta = event["contentBlockDelta"]["delta"]
+                if "toolUse" in delta and hasattr(self, '_current_tool_id'):
+                    tool_calls[self._current_tool_id]["arguments"] += delta["toolUse"]["input"]
+
+            elif "messageStop" in event:
+                stop_reason = event["messageStop"]["stopReason"]
+                # Extract usage data if available
+                final_usage = event["messageStop"].get("usage", {})
+
+        # Reconstruct response structure
+        response_content = []
+        if current_text:
+            response_content.append({"text": current_text})
+        
+        for t_id, t_data in tool_calls.items():
+            try:
+                args = json.loads(t_data["arguments"])
+            except:
+                args = {} # Error parsing
+            response_content.append({
+                "toolUse": {
+                    "toolUseId": t_id,
+                    "name": t_data["name"],
+                    "input": args
+                }
+            })
+
         return {
             "message": {
-                "content": content_blocks,
+                "content": response_content,
                 "role": "assistant"
             },
-            "stop_reason": choice.finish_reason,
-            "usage": response.usage.__dict__ if response.usage else {},
-            "id": response.id,
-            "model": response.model
+            "stop_reason": stop_reason,
+            "usage": final_usage, # Now includes actual usage data from OpenRouter
+            "id": "streaming-simulated",
+            "model": self._config.get("model_id")
         }
 
     async def structured_output(
@@ -455,7 +495,6 @@ class OpenRouterModel(Model):
         Generate structured output using Pydantic model.
         """
         full_response = ""
-        # Use self.stream to get the response
         async for event in self.stream(prompt, system_prompt=system_prompt, **kwargs):
             if "contentBlockDelta" in event:
                 delta = event["contentBlockDelta"]["delta"]
@@ -463,7 +502,6 @@ class OpenRouterModel(Model):
                     full_response += delta["text"]
                     yield {"partial": delta["text"]}
         
-        # Parse and validate
         try:
             data = json.loads(full_response)
             validated_model = output_model(**data)

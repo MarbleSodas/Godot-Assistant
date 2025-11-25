@@ -647,6 +647,58 @@ class GodotExecutorTools:
         except Exception as e:
             return self._create_error_response(f"Error reparenting node: {str(e)}", error_type=ErrorType.OPERATION_ERROR)
 
+    async def attach_script(
+        self,
+        node_path: str,
+        script_content: str,
+        script_path: Optional[str] = None,
+        tool_context: Optional[ToolContext] = None
+    ) -> Dict[str, Any]:
+        """Attach a GDScript to a node."""
+        if not await self.ensure_connection():
+            return self._create_error_response("Failed to connect to Godot plugin", error_type=ErrorType.CONNECTION_ERROR, retry_after=5)
+        try:
+            params = {
+                "path": node_path,
+                "script_content": script_content
+            }
+            if script_path:
+                params["script_path"] = script_path
+
+            response = await self.bridge.send_command("attach_script", **params)
+
+            if response.success:
+                if tool_context:
+                    try:
+                        state = tool_context.agent.state
+                        if hasattr(state, "get"):
+                            try:
+                                operation_history = state.get("operation_history") or []
+                            except TypeError:
+                                operation_history = state.get("operation_history")
+                                if operation_history is None:
+                                    operation_history = []
+                        else:
+                            operation_history = []
+
+                        operation_history.append({
+                            "type": "attach_script",
+                            "target": node_path,
+                            "result": True,
+                            "timestamp": time.time(),
+                            "details": {"script_path": script_path}
+                        })
+                        state.set("operation_history", operation_history)
+                    except Exception as e:
+                        logger.warning(f"Failed to update agent state: {e}")
+                
+                return self._create_success_response(f"Successfully attached script to {node_path}", data=response.data)
+            else:
+                return self._create_error_response(f"Failed to attach script: {response.error or 'Unknown error'}", error_type=ErrorType.OPERATION_ERROR)
+        except Exception as e:
+             return self._create_error_response(f"Error attaching script: {str(e)}", error_type=ErrorType.OPERATION_ERROR)
+
+
 
 # ============================================================================
 # Global Shared Instance
@@ -941,3 +993,30 @@ async def reparent_node(
 
     tools = get_godot_executor_tools()
     return await tools.reparent_node(node_path, new_parent_path, new_position, tool_context)
+
+
+@tool(context="tool_context")
+async def attach_script(
+    node_path: str,
+    script_content: str,
+    script_path: Optional[str] = None,
+    tool_context: Any = None
+) -> Dict[str, Any]:
+    """Attach a GDScript to a node.
+
+    Args:
+        node_path: Path to the node to attach the script to (Required)
+        script_content: The content of the GDScript (Required)
+        script_path: Optional path to save the script file (e.g., "res://scripts/my_script.gd")
+    Returns:
+        Strands-compatible dictionary with operation outcome
+    """
+    if not node_path or not script_content:
+        return {
+            "status": "error",
+            "error_type": "ValidationError",
+            "content": [{"text": "Both 'node_path' and 'script_content' are REQUIRED parameters."}]
+        }
+
+    tools = get_godot_executor_tools()
+    return await tools.attach_script(node_path, script_content, script_path, tool_context)

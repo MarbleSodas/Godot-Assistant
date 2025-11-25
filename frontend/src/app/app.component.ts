@@ -7,15 +7,20 @@ import { DesktopService } from './services/desktop.service';
 
 interface SessionMetrics {
   totalTokens: number;
+  promptTokens: number;
+  completionTokens: number;
   sessionCost: number;
   projectTotalCost: number;
   toolCalls: number;
   toolErrors: number;
+  generationTimeMs?: number;
 }
 
 interface AgentConfig {
   projectPath: string;
-  model: string;
+  planningModel: string;
+  executorModel: string;
+  openRouterKey: string;
   status: 'idle' | 'working' | 'stopped' | 'paused';
   showSettings: boolean;
   godotVersion: string;
@@ -88,28 +93,22 @@ interface GroupedEvent {
             <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
             </svg>
-            Performance
+            Session
           </div>
           
           <div class="space-y-3">
             <div class="flex justify-between items-baseline">
-              <span class="text-[11px] text-slate-400">Session Cost</span>
+              <span class="text-[11px] text-slate-400">Cost</span>
               <span class="font-mono text-sm text-white">\${{ metrics().sessionCost.toFixed(4) }}</span>
-            </div>
-            <div class="w-full bg-[#2b303b] h-1 rounded-full overflow-hidden">
-               <div class="bg-green-500 h-full rounded-full" [style.width.%]="(metrics().sessionCost * 1000) % 100"></div>
             </div>
 
             <div class="flex justify-between items-baseline">
                <span class="text-[11px] text-slate-400">Tokens</span>
                <span class="font-mono text-sm text-[#478cbf]">{{ metrics().totalTokens | number }}</span>
             </div>
-             <div class="flex justify-between items-baseline pt-2 border-t border-[#363d4a]">
-               <span class="text-[11px] text-slate-400">Project Total</span>
-               <span class="font-mono text-sm text-slate-300">\${{ metrics().projectTotalCost.toFixed(2) }}</span>
-            </div>
-            
-             <div class="flex justify-between items-baseline">
+
+            <!-- Token breakdown -->
+            <div class="flex justify-between items-baseline">
                <span class="text-[11px] text-slate-400">Tool Stats</span>
                <div class="flex gap-2 font-mono text-xs">
                   <span class="text-green-400" title="Calls">✓ {{ metrics().toolCalls }}</span>
@@ -117,6 +116,33 @@ interface GroupedEvent {
                </div>
             </div>
           </div>
+
+          <!-- Project Metrics -->
+          @if (projectMetrics()) {
+             <div class="mt-4 pt-3 border-t border-[#363d4a] space-y-3">
+                <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
+                    </svg>
+                    Project
+                </div>
+                
+                <div class="flex justify-between items-baseline">
+                   <span class="text-[11px] text-slate-400">Total Cost</span>
+                   <span class="font-mono text-sm text-white">\${{ projectMetrics()?.total_cost | number:'1.2-4' }}</span>
+                </div>
+                
+                <div class="flex justify-between items-baseline">
+                   <span class="text-[11px] text-slate-400">Total Tokens</span>
+                   <span class="font-mono text-sm text-[#478cbf]">{{ projectMetrics()?.total_tokens | number }}</span>
+                </div>
+
+                 <div class="flex justify-between items-baseline">
+                   <span class="text-[11px] text-slate-400">Sessions</span>
+                   <span class="font-mono text-sm text-slate-300">{{ projectMetrics()?.total_sessions }}</span>
+                </div>
+             </div>
+          }
         </div>
         
         <!-- Footer -->
@@ -141,28 +167,75 @@ interface GroupedEvent {
         
         <!-- Settings Overlay (Configuration Menu) -->
         @if (config().showSettings) {
-          <div class="absolute inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-start justify-end p-4">
-            <div class="bg-[#2b303b] border border-[#363d4a] rounded-xl shadow-2xl w-80 p-4 animate-in fade-in slide-in-from-top-2">
-              <div class="flex justify-between items-center mb-4 border-b border-[#363d4a] pb-2">
-                <h3 class="font-bold text-white">Configuration</h3>
-                <button (click)="toggleSettings()" class="text-slate-400 hover:text-white">
-                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <div class="absolute inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
+            <div class="bg-[#2b303b] border border-[#363d4a] rounded-xl shadow-2xl w-[500px] p-6 animate-in fade-in slide-in-from-top-2">
+              <div class="flex justify-between items-center mb-6 border-b border-[#363d4a] pb-4">
+                <h3 class="font-bold text-white text-lg">Configuration</h3>
+                <button (click)="toggleSettings()" class="text-slate-400 hover:text-white transition-colors">
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
                   </svg>
                 </button>
               </div>
-              <div class="space-y-4">
+              
+              <div class="space-y-5">
+                <!-- Planning Model -->
                 <div>
-                  <label class="block text-xs text-slate-400 mb-1">Project Path</label>
-                  <input type="text" [value]="config().projectPath" disabled class="w-full bg-[#212529] border border-[#363d4a] rounded px-2 py-1.5 text-xs text-slate-300 font-mono opacity-75">
-                </div>
-                <div>
-                  <label class="block text-xs text-slate-400 mb-1">Model</label>
-                  <select class="w-full bg-[#212529] border border-[#363d4a] rounded px-2 py-1.5 text-xs text-white focus:ring-1 focus:ring-[#478cbf] outline-none">
-                    <option>claude-3-5-sonnet</option>
-                    <option>gpt-4o</option>
+                  <label class="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Planning Agent Model</label>
+                  <select 
+                    [ngModel]="config().planningModel" 
+                    (ngModelChange)="updateConfigField('planningModel', $event)"
+                    class="w-full bg-[#1a1d21] border border-[#363d4a] rounded-lg px-3 py-2.5 text-sm text-white focus:ring-1 focus:ring-[#478cbf] focus:border-[#478cbf] outline-none transition-all appearance-none">
+                    @for (option of modelOptions; track option.id) {
+                      <option [value]="option.id">{{ option.name }}</option>
+                    }
                   </select>
                 </div>
+
+                <!-- Executor Model -->
+                <div>
+                  <label class="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Executor Agent Model</label>
+                  <select 
+                    [ngModel]="config().executorModel" 
+                    (ngModelChange)="updateConfigField('executorModel', $event)"
+                    class="w-full bg-[#1a1d21] border border-[#363d4a] rounded-lg px-3 py-2.5 text-sm text-white focus:ring-1 focus:ring-[#478cbf] focus:border-[#478cbf] outline-none transition-all appearance-none">
+                    @for (option of modelOptions; track option.id) {
+                      <option [value]="option.id">{{ option.name }}</option>
+                    }
+                  </select>
+                </div>
+
+                <!-- API Key -->
+                <div>
+                  <label class="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">OpenRouter API Key</label>
+                  <div class="relative">
+                    <input 
+                      type="password" 
+                      [ngModel]="config().openRouterKey" 
+                      (ngModelChange)="updateConfigField('openRouterKey', $event)"
+                      placeholder="sk-or-..."
+                      class="w-full bg-[#1a1d21] border border-[#363d4a] rounded-lg px-3 py-2.5 text-sm text-white focus:ring-1 focus:ring-[#478cbf] focus:border-[#478cbf] outline-none transition-all placeholder-slate-600">
+                  </div>
+                  <p class="text-[10px] text-slate-500 mt-1.5">Key is stored locally in your project configuration.</p>
+                </div>
+
+                <!-- Project Path (Read-only) -->
+                <div>
+                  <label class="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Project Path</label>
+                  <div class="w-full bg-[#1a1d21] border border-[#363d4a] rounded-lg px-3 py-2.5 text-xs text-slate-400 font-mono truncate opacity-75 select-all">
+                    {{ config().projectPath }}
+                  </div>
+                </div>
+              </div>
+
+              <!-- Footer Actions -->
+              <div class="mt-8 pt-4 border-t border-[#363d4a] flex justify-end gap-3">
+                <button (click)="toggleSettings()" class="px-4 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-[#363d4a] transition-colors">
+                  Cancel
+                </button>
+                <button (click)="saveSettings()" class="px-4 py-2 rounded-lg text-sm font-medium text-white bg-[#478cbf] hover:bg-[#3a7ca8] shadow-lg shadow-blue-900/20 transition-all transform active:scale-95">
+                  Save Changes
+                </button>
               </div>
             </div>
           </div>
@@ -194,7 +267,7 @@ interface GroupedEvent {
         </div>
 
         <!-- Messages Container -->
-        <div class="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 scroll-smooth" #scrollContainer>
+        <div class="flex-1 overflow-y-auto p-4 md:p-8 space-y-4 scroll-smooth" #scrollContainer>
           
           <!-- Welcome Message -->
           @if (messages().length === 0) {
@@ -230,7 +303,7 @@ interface GroupedEvent {
 
               <!-- Content -->
               <div class="flex flex-col max-w-[85%]" [class.items-end]="msg.role === 'user'">
-                <div class="relative px-5 py-3.5 rounded-2xl text-sm leading-relaxed shadow-sm"
+                <div class="relative px-5 py-2 rounded-2xl text-sm leading-relaxed shadow-sm"
                      [class.bg-[#2b303b]]="msg.role === 'assistant'"
                      [class.text-slate-200]="msg.role === 'assistant'"
                      [class.rounded-tl-none]="msg.role === 'assistant'"
@@ -255,13 +328,13 @@ interface GroupedEvent {
                         @if (groupedEvent.type === 'text_block') {
                           <!-- Text block with markdown support and smooth animation -->
                           <div class="slide-in-from-bottom">
-                            <markdown class="whitespace-pre-wrap font-light prose prose-invert prose-sm max-w-none [&>*:first-child]:mt-0 [&>*:last-child]:mb-0" [data]="groupedEvent.content"></markdown>
+                            <markdown class="whitespace-pre-wrap font-light prose prose-invert prose-sm max-w-none [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 prose-p:my-0 !important prose-headings:my-1 !important prose-ul:my-0 !important prose-ol:my-0 !important prose-li:my-0 !important [&_li>p]:my-0 !important" [data]="groupedEvent.content"></markdown>
                           </div>
                         } @else if (groupedEvent.type === 'tool') {
                           <!-- Tool call (inline with chronological flow) -->
                           @if (groupedEvent.toolCall) {
-                            <div class="my-3">
-                              <div class="bg-[#1a1d21] rounded p-2.5 border border-[#363d4a] text-xs">
+                            <div class="my-0">
+                              <div class="bg-[#1a1d21] rounded p-1.5 border border-[#363d4a] text-xs">
                                 <div class="flex items-center justify-between mb-1.5">
                                   <div class="flex items-center gap-1.5">
                                     <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5 text-[#478cbf]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -350,12 +423,50 @@ interface GroupedEvent {
 
                 <!-- Message Metrics -->
                 @if (!msg.isStreaming && msg.cost !== undefined) {
-                  <div class="flex items-center gap-3 mt-1.5 px-1 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
-                     <div class="flex items-center gap-1 text-[10px] text-slate-500 font-mono">
+                  <div class="relative flex items-center gap-3 mt-1.5 px-1 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
+                     <div class="flex items-center gap-1 text-[10px] text-slate-500 font-mono cursor-help group/tooltip">
                         <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
                         </svg>
                         <span>{{ msg.tokens }} tok</span>
+
+                        <!-- Detailed tooltip -->
+                        <div class="absolute bottom-full left-0 mb-2 w-64 bg-[#1a1d21] border border-[#363d4a] rounded-lg p-3 shadow-xl opacity-0 group-hover/tooltip:opacity-100 transition-opacity duration-200 pointer-events-none z-50">
+                          <div class="space-y-2 text-xs">
+                            @if (msg.modelName) {
+                              <div class="flex justify-between">
+                                <span class="text-slate-500">Model:</span>
+                                <span class="text-slate-300 font-mono text-[10px]">{{ msg.modelName }}</span>
+                              </div>
+                            }
+                            @if (msg.promptTokens !== undefined) {
+                              <div class="flex justify-between">
+                                <span class="text-slate-500">Prompt Tokens:</span>
+                                <span class="text-[#478cbf] font-mono">{{ msg.promptTokens | number }}</span>
+                              </div>
+                            }
+                            @if (msg.completionTokens !== undefined) {
+                              <div class="flex justify-between">
+                                <span class="text-slate-500">Completion Tokens:</span>
+                                <span class="text-[#478cbf] font-mono">{{ msg.completionTokens | number }}</span>
+                              </div>
+                            }
+                            <div class="flex justify-between pt-1 border-t border-[#363d4a]">
+                              <span class="text-slate-500">Total Tokens:</span>
+                              <span class="text-white font-mono font-semibold">{{ msg.tokens | number }}</span>
+                            </div>
+                            <div class="flex justify-between">
+                              <span class="text-slate-500">Cost:</span>
+                              <span class="text-green-400 font-mono">\${{ msg.cost.toFixed(6) }}</span>
+                            </div>
+                            @if (msg.generationTimeMs) {
+                              <div class="flex justify-between">
+                                <span class="text-slate-500">Time:</span>
+                                <span class="text-slate-300 font-mono">{{ msg.generationTimeMs }}ms</span>
+                              </div>
+                            }
+                          </div>
+                        </div>
                      </div>
                      <div class="flex items-center gap-1 text-[10px] text-slate-500 font-mono">
                         <span>$</span>
@@ -612,6 +723,19 @@ interface GroupedEvent {
 export class App implements AfterViewChecked, OnInit {
   @ViewChild('scrollContainer') private scrollContainer!: ElementRef;
 
+  // Model Options
+  allowedModels = {
+    "Gemini 3 Pro": "google/gemini-3-pro-preview",
+    "Grok 4.1 Fast": "x-ai/grok-4.1-fast",
+    "Sonnet 4.5": "anthropic/claude-sonnet-4.5",
+    "Haiku 4.5": "anthropic/claude-haiku-4.5",
+    "Minimax M2": "minimax/minimax-m2",
+    "GPT 5.1 Codex": "openai/gpt-5.1-codex",
+    "GLM 4.6": "z-ai/glm-4.6"
+  };
+
+  modelOptions = Object.entries(this.allowedModels).map(([name, id]) => ({ name, id }));
+
   // Signals for Reactive State
   userInput = signal('');
   messages = signal<Message[]>([]);
@@ -622,7 +746,9 @@ export class App implements AfterViewChecked, OnInit {
 
   config = signal<AgentConfig>({
     projectPath: '',
-    model: 'claude-3-5-sonnet',
+    planningModel: 'google/gemini-3-pro-preview',
+    executorModel: 'anthropic/claude-sonnet-4.5',
+    openRouterKey: '',
     status: 'idle',
     showSettings: false,
     godotVersion: '',
@@ -633,11 +759,16 @@ export class App implements AfterViewChecked, OnInit {
 
   metrics = signal<SessionMetrics>({
     totalTokens: 0,
+    promptTokens: 0,
+    completionTokens: 0,
     sessionCost: 0.00,
     projectTotalCost: 0.00,
     toolCalls: 0,
-    toolErrors: 0
+    toolErrors: 0,
+    generationTimeMs: undefined
   });
+  
+  projectMetrics = signal<any>(null);
 
   // Task list sidebar state
   taskSidebarOpen = signal(false);
@@ -664,122 +795,15 @@ export class App implements AfterViewChecked, OnInit {
   ngOnInit() {
     this.loadSessions();
     this.loadSystemInfo();
+    this.loadAgentConfig();
+    this.chatService.projectMetrics$.subscribe(m => this.projectMetrics.set(m));
   }
 
   ngAfterViewChecked() {
     this.scrollToBottom();
   }
-
-  scrollToBottom(): void {
-    try {
-      this.scrollContainer.nativeElement.scrollTop = this.scrollContainer.nativeElement.scrollHeight;
-    } catch (err) { }
-  }
-
-  /**
-   * Filter out execution-plan JSON blocks from message content.
-   * These blocks are parsed by the backend and emitted as plan_created events,
-   * so we don't need to display them as raw text.
-   */
-  filterExecutionPlanBlocks(content: string): string {
-    if (!content) return content;
-
-    // Remove ```execution-plan ... ``` code blocks
-    const pattern = /```execution-plan[\s\S]*?```/g;
-    return content.replace(pattern, '').trim();
-  }
-
-  /**
-   * Groups consecutive text events into single text blocks while keeping tool events separate.
-   * This allows text to flow naturally while maintaining chronological tool ordering.
-   * Also filters out execution plan JSON blocks from the grouped text.
-   */
-  getGroupedEvents(msg: Message): GroupedEvent[] {
-    if (!msg.events || msg.events.length === 0) {
-      return [];
-    }
-
-    const grouped: GroupedEvent[] = [];
-    let currentTextBlock = '';
-    let textBlockSequence = 0;
-
-    for (const event of msg.events) {
-      if (event.type === 'text') {
-        // Add to current text block
-        if (currentTextBlock === '') {
-          textBlockSequence = event.sequence;
-        }
-        currentTextBlock += event.content || '';
-      } else {
-        // Tool event - flush current text block if any (with filtering applied)
-        if (currentTextBlock) {
-          grouped.push({
-            type: 'text_block',
-            content: this.filterExecutionPlanBlocks(currentTextBlock),
-            sequence: textBlockSequence
-          });
-          currentTextBlock = '';
-        }
-
-        // Add tool event
-        if (event.toolCall) {
-          grouped.push({
-            type: 'tool',
-            toolCall: event.toolCall,
-            sequence: event.sequence
-          });
-        }
-      }
-    }
-
-    // Flush remaining text block (with filtering applied)
-    if (currentTextBlock) {
-      grouped.push({
-        type: 'text_block',
-        content: this.filterExecutionPlanBlocks(currentTextBlock),
-        sequence: textBlockSequence
-      });
-    }
-
-    return grouped;
-  }
-
-  loadSystemInfo() {
-    console.log('[App] Loading system info...');
-
-    // First, fetch the current status via HTTP GET to get initial state
-    this.desktopService.getGodotStatus().subscribe({
-      next: (status) => {
-        console.log('[App] Initial Godot status:', status);
-        this.updateGodotConfig(status);
-      },
-      error: (err) => {
-        console.error('[App] Error fetching initial Godot status:', err);
-        // Set disconnected state on error
-        this.config.update(c => ({
-          ...c,
-          godotConnected: false,
-          godotVersion: ''
-        }));
-      }
-    });
-
-    // Then subscribe to real-time Godot status updates via SSE
-    this.desktopService.streamGodotStatus().subscribe({
-      next: (status) => {
-        console.log('[App] SSE Godot status update:', status);
-        this.updateGodotConfig(status);
-      },
-      error: (err) => {
-        console.error('[App] SSE stream error:', err);
-        // Fallback to disconnected state on error
-        this.config.update(c => ({
-          ...c,
-          godotConnected: false
-        }));
-      }
-    });
-  }
+  
+  // ...
 
   private updateGodotConfig(status: any) {
     const connectionState = status.state || 'disconnected';
@@ -788,6 +812,14 @@ export class App implements AfterViewChecked, OnInit {
     const path = status.project_path || '';
 
     console.log('[App] Updating config - State:', connectionState, 'Connected:', isConnected, 'Version:', version, 'Path:', path);
+
+    // Check if project path changed
+    if (path && path !== this.config().projectPath) {
+        console.log(`[App] Project path changed: ${path}`);
+        this.chatService.setProjectPath(path);
+        // Reload sessions for the new project
+        this.loadSessions();
+    }
 
     this.config.update(c => ({
       ...c,
@@ -798,8 +830,21 @@ export class App implements AfterViewChecked, OnInit {
     }));
   }
 
+
   loadSessions() {
     this.chatService.listSessions().subscribe(sessions => {
+      const currentId = this.currentSessionId();
+      
+      // If we have an active session that isn't in the new list (e.g. just switched project),
+      // keep it visible so we don't lose context. It will be saved to the project DB on next message.
+      if (currentId && !sessions.find(s => s.id === currentId)) {
+        const existing = this.sessions().find(s => s.id === currentId);
+        if (existing) {
+           console.log(`[App] Preserving active session ${currentId} in list despite project switch`);
+           sessions.unshift(existing);
+        }
+      }
+
       this.sessions.set(sessions);
       if (sessions.length > 0 && !this.currentSessionId()) {
         this.selectSession(sessions[0].id);
@@ -1140,9 +1185,23 @@ export class App implements AfterViewChecked, OnInit {
           // Handle metrics if present in any event
           if (chunk.data?.metrics) {
             const m = chunk.data.metrics;
+
+            // Update message-specific metrics
+            if (m.total_tokens) updatedMsg.tokens = m.total_tokens;
+            if (m.input_tokens) updatedMsg.promptTokens = m.input_tokens;
+            if (m.output_tokens) updatedMsg.completionTokens = m.output_tokens;
+            // Only use actual_cost from OpenRouter, do not calculate or estimate
+            if (m.actual_cost !== undefined) updatedMsg.cost = m.actual_cost;
+            if (m.model_id) updatedMsg.modelName = m.model_id;
+            if (m.generation_time_ms) updatedMsg.generationTimeMs = m.generation_time_ms;
+
+            // Always track tokens, but only track cost if actual_cost is available
+            const hasCost = m.actual_cost !== undefined;
             this.updateMetrics(
               m.total_tokens || 0,
-              m.actual_cost || m.estimated_cost || 0,
+              m.input_tokens || 0,
+              m.output_tokens || 0,
+              hasCost ? m.actual_cost : 0,
               m.tool_calls || 0,
               m.tool_errors || 0
             );
@@ -1240,9 +1299,18 @@ export class App implements AfterViewChecked, OnInit {
       error: (err) => console.error('Failed to stop agent:', err)
     });
   }
-  updateMetrics(tokens: number, cost: number, toolCalls: number = 0, toolErrors: number = 0) {
+  updateMetrics(
+    totalTokens: number,
+    promptTokens: number,
+    completionTokens: number,
+    cost: number,
+    toolCalls: number = 0,
+    toolErrors: number = 0
+  ) {
     this.metrics.update(m => ({
-      totalTokens: m.totalTokens + tokens,
+      totalTokens: m.totalTokens + totalTokens,
+      promptTokens: m.promptTokens + promptTokens,
+      completionTokens: m.completionTokens + completionTokens,
       sessionCost: m.sessionCost + cost,
       projectTotalCost: m.projectTotalCost + cost,
       toolCalls: m.toolCalls + toolCalls,

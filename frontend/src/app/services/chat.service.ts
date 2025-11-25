@@ -1,6 +1,12 @@
 import { Injectable, signal } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
-import { Observable, map, tap } from 'rxjs';
+import { Observable, map, tap, BehaviorSubject } from 'rxjs';
+
+export interface ProjectMetrics {
+  total_cost: number;
+  total_tokens: number;
+  total_sessions: number;
+}
 
 export interface ToolCall {
   name: string;
@@ -40,7 +46,11 @@ export interface Message {
   content: string;
   timestamp: Date;
   tokens?: number;
+  promptTokens?: number;
+  completionTokens?: number;
   cost?: number;
+  modelName?: string;
+  generationTimeMs?: number;
   isStreaming?: boolean;
 
   // Extended fields for agentic flow
@@ -61,8 +71,25 @@ export interface Session {
 })
 export class ChatService {
   private apiUrl = 'http://127.0.0.1:8000/api/agent';
+  private currentProjectPath: string | null = null;
+  public projectMetrics$ = new BehaviorSubject<ProjectMetrics | null>(null);
 
   constructor(private http: HttpClient) { }
+
+  setProjectPath(path: string) {
+    this.currentProjectPath = path;
+    this.loadProjectMetrics();
+  }
+
+  private loadProjectMetrics() {
+    if (!this.currentProjectPath) return;
+    this.http.get<any>(`${this.apiUrl}/metrics/project?path=${encodeURIComponent(this.currentProjectPath)}`)
+      .subscribe(response => {
+          if (response.status === 'success') {
+              this.projectMetrics$.next(response.metrics);
+          }
+      });
+  }
 
   // Session Management
   createSession(sessionId: string, title?: string): Observable<any> {
@@ -74,10 +101,31 @@ export class ChatService {
   }
 
   listSessions(): Observable<Session[]> {
-    return this.http.get<any>(`${this.apiUrl}/sessions`).pipe(
+    let url = `${this.apiUrl}/sessions`;
+    if (this.currentProjectPath) {
+        url += `?path=${encodeURIComponent(this.currentProjectPath)}`;
+    }
+    return this.http.get<any>(url).pipe(
       map(response => {
         if (response.status === 'success' && response.sessions) {
-          // Backend returns a dictionary of sessions
+           // Handle ProjectDB list format (array)
+           if (Array.isArray(response.sessions)) {
+             return response.sessions.map((s: any) => {
+                // Handle timestamps: last_updated > created_at > Date.now()
+                let timestamp = Date.now();
+                if (s.last_updated) timestamp = s.last_updated * 1000;
+                else if (s.created_at) timestamp = s.created_at * 1000;
+                
+                return {
+                    id: s.id,
+                    title: s.title || `Session ${s.id.substring(0, 8)}`,
+                    date: new Date(timestamp),
+                    active: false
+                };
+             }).sort((a: any, b: any) => b.date.getTime() - a.date.getTime());
+           }
+        
+          // Handle Legacy format (dict)
           return Object.entries(response.sessions).map(([id, data]: [string, any]) => ({
             id: id,
             title: data.metadata?.title || `Session ${id}`,
@@ -91,16 +139,33 @@ export class ChatService {
   }
 
   getSession(sessionId: string): Observable<any> {
-    return this.http.get(`${this.apiUrl}/sessions/${sessionId}`);
+    let url = `${this.apiUrl}/sessions/${sessionId}`;
+    if (this.currentProjectPath) {
+        url += `?path=${encodeURIComponent(this.currentProjectPath)}`;
+    }
+    return this.http.get(url);
   }
 
   deleteSession(sessionId: string): Observable<any> {
-    return this.http.delete(`${this.apiUrl}/sessions/${sessionId}`);
+    let url = `${this.apiUrl}/sessions/${sessionId}`;
+    if (this.currentProjectPath) {
+        url += `?path=${encodeURIComponent(this.currentProjectPath)}`;
+    }
+    return this.http.delete(url);
+  }
+  
+  restoreSession(sessionId: string): Observable<any> {
+    if (!this.currentProjectPath) throw new Error("Project path not set");
+    return this.http.post(`${this.apiUrl}/sessions/${sessionId}/restore?path=${encodeURIComponent(this.currentProjectPath)}`, {});
   }
 
   // Chat Interaction
   sendMessage(sessionId: string, message: string, mode: 'planning' | 'fast' = 'planning'): Observable<any> {
-    return this.http.post(`${this.apiUrl}/sessions/${sessionId}/chat`, { message, mode });
+    let url = `${this.apiUrl}/sessions/${sessionId}/chat`;
+    if (this.currentProjectPath) {
+        url += `?path=${encodeURIComponent(this.currentProjectPath)}`;
+    }
+    return this.http.post(url, { message, mode });
   }
 
   stopSession(sessionId: string): Observable<any> {
@@ -108,7 +173,11 @@ export class ChatService {
   }
 
   async *sendMessageStream(sessionId: string, message: string, mode: 'planning' | 'fast' = 'planning', signal?: AbortSignal): AsyncGenerator<any> {
-    const response = await fetch(`${this.apiUrl}/sessions/${sessionId}/chat/stream`, {
+    let url = `${this.apiUrl}/sessions/${sessionId}/chat/stream`;
+    if (this.currentProjectPath) {
+        url += `?path=${encodeURIComponent(this.currentProjectPath)}`;
+    }
+    const response = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -241,5 +310,14 @@ export class ChatService {
   // Plan Generation (Direct Agent)
   createPlan(prompt: string): Observable<any> {
     return this.http.post(`${this.apiUrl}/plan`, { prompt });
+  }
+
+  // Configuration
+  getConfig(): Observable<any> {
+    return this.http.get(`${this.apiUrl}/config`);
+  }
+
+  updateConfig(config: { planning_model?: string; executor_model?: string; openrouter_api_key?: string }): Observable<any> {
+    return this.http.post(`${this.apiUrl}/config`, config);
   }
 }
