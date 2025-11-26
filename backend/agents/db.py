@@ -39,13 +39,12 @@ class ProjectDB:
         conn = self._get_connection()
         cursor = conn.cursor()
         
-        # Sessions Table
+        # Sessions Table (chat_history removed - stored in FileSessionManager)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 project_hash TEXT,
                 created_at REAL,
-                chat_history JSON,
                 last_updated REAL
             )
         """)
@@ -62,98 +61,103 @@ class ProjectDB:
                 model_name TEXT
             )
         """)
+
+        # Message-level Metrics Table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS message_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_hash TEXT,
+                session_id TEXT,
+                message_id TEXT,
+                role TEXT,
+                cost REAL,
+                tokens INTEGER,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                timestamp REAL,
+                model_name TEXT
+            )
+        """)
         
         conn.commit()
         conn.close()
 
     # --- Session Methods ---
 
-    def save_session(self, session_id: str, chat_history: List[Dict[str, Any]]):
+    def save_session(self, session_id: str):
+        """
+        Initialize session metadata in database.
+
+        NOTE: Chat history is stored in FileSessionManager, NOT in ProjectDB.
+        ProjectDB only tracks session existence for metrics correlation.
+
+        Args:
+            session_id: Session ID
+        """
         conn = self._get_connection()
         cursor = conn.cursor()
         now = time.time()
-        
-        # Check if exists to preserve created_at if it's an update
-        # For now, we use upsert. If we want to strictly preserve creation time:
-        # We could check first. But 'created_at' implies when the session started.
-        # Let's assume the caller handles session creation time or we set it on first insert.
-        
-        # Try insert, if conflict update
-        # We need to know if it's new to set created_at properly?
-        # Actually, the schema has created_at. 
-        # If we just upsert, we might overwrite created_at if we pass it?
-        # The query below sets created_at on INSERT.
-        # On UPDATE, it only updates chat_history and last_updated.
-        
+
         cursor.execute("""
-            INSERT INTO sessions (session_id, project_hash, created_at, chat_history, last_updated)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO sessions (session_id, project_hash, created_at, last_updated)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
-                chat_history = excluded.chat_history,
                 last_updated = excluded.last_updated
-        """, (session_id, self.project_hash, now, json.dumps(chat_history), now))
-        
+        """, (session_id, self.project_hash, now, now))
+
         conn.commit()
         conn.close()
 
     def get_all_sessions(self) -> List[Dict[str, Any]]:
         conn = self._get_connection()
         cursor = conn.cursor()
-        
+
         cursor.execute("""
-            SELECT session_id, created_at, last_updated, chat_history 
-            FROM sessions 
+            SELECT session_id, created_at, last_updated
+            FROM sessions
             WHERE project_hash = ?
             ORDER BY last_updated DESC
         """, (self.project_hash,))
-        
+
         rows = cursor.fetchall()
         sessions = []
         for row in rows:
-            try:
-                history = json.loads(row[3])
-            except:
-                history = []
-                
             sessions.append({
                 "id": row[0],
                 "created_at": row[1],
-                "last_updated": row[2],
-                "chat_history": history
+                "last_updated": row[2]
             })
-            
+
         conn.close()
         return sessions
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         conn = self._get_connection()
         cursor = conn.cursor()
-        
+
         cursor.execute("""
-            SELECT session_id, created_at, last_updated, chat_history 
-            FROM sessions 
+            SELECT session_id, created_at, last_updated
+            FROM sessions
             WHERE session_id = ?
         """, (session_id,))
-        
+
         row = cursor.fetchone()
         conn.close()
-        
+
         if row:
-            try:
-                history = json.loads(row[3])
-            except:
-                history = []
             return {
                 "id": row[0],
                 "created_at": row[1],
-                "last_updated": row[2],
-                "chat_history": history
+                "last_updated": row[2]
             }
         return None
 
     def delete_session(self, session_id: str):
+        """Delete session metadata ONLY, preserving metrics."""
         conn = self._get_connection()
         cursor = conn.cursor()
+        # Only delete from sessions table, NOT from metrics table
+        # This preserves historical project cost/usage data
         cursor.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         conn.commit()
         conn.close()
@@ -169,6 +173,50 @@ class ProjectDB:
             INSERT INTO metrics (project_hash, session_id, cost, tokens, timestamp, model_name)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (self.project_hash, session_id, cost, tokens, now, model_name))
+
+        conn.commit()
+        conn.close()
+
+    def record_message_metric(
+        self,
+        session_id: str,
+        message_id: str,
+        role: str,
+        cost: float,
+        tokens: int,
+        model_name: str,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0
+    ):
+        """
+        Record metrics for an individual message.
+
+        Args:
+            session_id: The session ID
+            message_id: Unique message identifier
+            role: Message role ("user", "assistant", "system")
+            cost: Cost of the message
+            tokens: Total tokens used
+            model_name: Model that generated the response
+            prompt_tokens: Input tokens (optional)
+            completion_tokens: Output tokens (optional)
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        now = time.time()
+
+        cursor.execute("""
+            INSERT INTO message_metrics (
+                project_hash, session_id, message_id, role,
+                cost, tokens, prompt_tokens, completion_tokens,
+                timestamp, model_name
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            self.project_hash, session_id, message_id, role,
+            cost, tokens, prompt_tokens, completion_tokens,
+            now, model_name
+        ))
 
         conn.commit()
         conn.close()

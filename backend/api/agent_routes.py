@@ -10,6 +10,7 @@ Provides endpoints for interacting with the planning agent:
 import asyncio
 import json
 import logging
+import re
 from typing import Optional, AsyncIterable
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -24,11 +25,12 @@ logger = logging.getLogger(__name__)
 
 def _extract_title_from_chat_history(chat_history: list) -> str:
     """
-    Extract a meaningful title from the chat history.
+    Extract meaningful title with robust cleaning.
 
-    Priority order:
-    1. First user message (trimmed to reasonable length)
-    2. If no user messages, fall back to "Session {id}"
+    Handles:
+    - Code blocks (markdown)
+    - Excessive whitespace
+    - Long content (truncates at word boundary)
 
     Args:
         chat_history: List of chat messages from the database
@@ -39,22 +41,34 @@ def _extract_title_from_chat_history(chat_history: list) -> str:
     if not chat_history:
         return "New Session"
 
-    # Find the first user message
     for message in chat_history:
         if isinstance(message, dict) and message.get("role") == "user":
             content = message.get("content", "")
-            if content:
-                # Clean up the content for display
-                # Remove excessive whitespace and truncate
+            if content and isinstance(content, str):
+                # Step 1: Strip whitespace
                 content = content.strip()
-                # Replace newlines with spaces
-                content = ' '.join(content.split())
-                # Truncate to reasonable length for title
-                if len(content) > 50:
-                    content = content[:50] + "..."
+
+                # Step 2: Remove markdown code blocks
+                content = re.sub(r'^```[\w]*\s*', '', content)
+                content = re.sub(r'```\s*$', '', content)
+
+                # Step 3: Normalize whitespace (newlines → spaces, multiple → single)
+                content = re.sub(r'\s+', ' ', content)
+
+                # Step 4: Truncate at word boundary
+                max_length = 50
+                if len(content) > max_length:
+                    # Try to break at last word boundary before limit
+                    truncated = content[:max_length].rsplit(' ', 1)[0]
+                    # Only use truncated if it's substantial (>20 chars)
+                    if len(truncated) > 20:
+                        content = truncated + "..."
+                    else:
+                        # Just hard truncate
+                        content = content[:max_length] + "..."
+
                 return content if content else "New Session"
 
-    # Fallback if no user message found
     return "New Session"
 
 # Create router
@@ -377,99 +391,69 @@ async def create_session(request: SessionRequest):
 @router.get("/sessions", response_model=dict)
 async def list_sessions(path: Optional[str] = Query(None)):
     """
-    List all available sessions.
+    List sessions for a specific project.
 
-    Prioritizes database sessions, falls back to file-based sessions if database is empty.
+    IMPORTANT: If path is provided, ONLY return sessions for that project.
+    If no path, return empty list (don't leak cross-project data).
 
     Args:
         path: Optional project path for database filtering
 
     Returns:
-        List of sessions
+        List of sessions for the specified project
     """
     try:
-        # Try database first (preferred source)
-        if path:
-            try:
-                db = ProjectDB(path)
-                db_sessions = db.get_all_sessions()
+        # Require path for security/isolation
+        if not path:
+            logger.info("No project path provided, returning empty session list")
+            return {"status": "success", "sessions": {}}
 
-                if db_sessions:
-                    # Convert database sessions to expected format
-                    sessions_dict = {}
-                    for session in db_sessions:
-                        session_id = session["id"]
+        # Only load from ProjectDB for the specified path
+        db = ProjectDB(path)
+        db_sessions = db.get_all_sessions()
 
-                        # Extract meaningful title from chat history
-                        title = _extract_title_from_chat_history(session.get("chat_history", []))
+        sessions_dict = {}
+        for session in db_sessions:
+            session_id = session["id"]
+            title = _extract_title_from_chat_history(session.get("chat_history", []))
 
-                        sessions_dict[session_id] = {
-                            "session_id": session_id,
-                            "title": title,
-                            "date": session["created_at"],
-                            "active": False,  # Could check if session is in MultiAgentManager memory
-                            "is_running": False,
-                            "metadata": {
-                                "created_at": session["created_at"],
-                                "last_updated": session["last_updated"],
-                                "title": title
-                            },
-                            "path": f"database://{session_id}"
-                        }
+            sessions_dict[session_id] = {
+                "session_id": session_id,
+                "title": title,
+                "date": session["created_at"],
+                "active": False,
+                "is_running": False,
+                "metadata": {
+                    "created_at": session["created_at"],
+                    "last_updated": session["last_updated"],
+                    "title": title
+                },
+                "path": f"database://{session_id}"
+            }
 
-                    # Add metrics for database sessions
-                    try:
-                        session_ids = list(sessions_dict.keys())
-                        metrics_map = db.get_metrics_for_sessions(session_ids)
-
-                        for session_id, session_data in sessions_dict.items():
-                            if session_id in metrics_map:
-                                session_data["metrics"] = metrics_map[session_id]
-
-                    except Exception as metrics_error:
-                        logger.warning(f"Failed to get metrics for database sessions: {metrics_error}")
-
-                    logger.info(f"Retrieved {len(sessions_dict)} sessions from database for project: {path}")
-                    return {
-                        "status": "success",
-                        "sessions": sessions_dict
-                    }
-
-            except Exception as db_error:
-                logger.warning(f"Failed to get sessions from database: {db_error}")
-
-        # Fallback to file-based sessions
-        from agents.multi_agent_manager import get_multi_agent_manager
-        manager = get_multi_agent_manager()
-
-        sessions_dict = manager.list_sessions()
-
-        # Enhance with metrics if possible
+        # Always add metrics (with defaults if unavailable)
+        session_ids = list(sessions_dict.keys())
         try:
-            # Use a dummy path if none provided, just to access the global DB file
-            db_path = path if path else "."
-            db = ProjectDB(db_path)
-
-            session_ids = list(sessions_dict.keys())
             metrics_map = db.get_metrics_for_sessions(session_ids)
-
-            for session_id, session_data in sessions_dict.items():
-                if session_id in metrics_map:
-                    session_data["metrics"] = metrics_map[session_id]
-
+            for sid, sdata in sessions_dict.items():
+                sdata["metrics"] = metrics_map.get(sid, {
+                    "session_cost": 0.0,
+                    "session_tokens": 0
+                })
         except Exception as e:
-            logger.warning(f"Error fetching metrics for file sessions: {e}")
-            # Continue without metrics if DB fails
+            logger.error(f"Metrics fetch failed: {e}")
+            for sid, sdata in sessions_dict.items():
+                sdata["metrics"] = {
+                    "session_cost": 0.0,
+                    "session_tokens": 0
+                }
 
-        logger.info(f"Retrieved {len(sessions_dict)} sessions from file system (fallback)")
-        return {
-            "status": "success",
-            "sessions": sessions_dict
-        }
+        logger.info(f"Retrieved {len(sessions_dict)} sessions for project: {path}")
+        return {"status": "success", "sessions": sessions_dict}
 
     except Exception as e:
-        logger.error(f"Error listing sessions: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"List sessions error: {e}")
+        return {"status": "success", "sessions": {}}
 
 
 @router.get("/sessions/{session_id}", response_model=dict)
@@ -488,21 +472,12 @@ async def get_session(session_id: str, path: Optional[str] = Query(None)):
         from agents.multi_agent_manager import get_multi_agent_manager
         manager = get_multi_agent_manager()
 
-        # Primary source: FileSessionManager (always has latest conversation)
+        # Get chat history from FileSessionManager (single source of truth)
+        chat_history = manager.get_session_chat_history(session_id)
+
         try:
-            session_data = await manager.get_session_chat_history(session_id)
-
-            # If we have data and a path, sync to ProjectDB for future listing
-            if session_data and path:
-                try:
-                    db = ProjectDB(path)
-                    db.save_session(session_id, session_data)
-                    logger.info(f"Synced session {session_id} to ProjectDB")
-                except Exception as sync_error:
-                    logger.warning(f"Failed to sync session to ProjectDB: {sync_error}")
-
-            if session_data:
-                # Get metrics from database if available
+            if chat_history:
+                # Get metrics from database (always provide defaults if unavailable)
                 metrics = None
                 if path:
                     try:
@@ -511,9 +486,20 @@ async def get_session(session_id: str, path: Optional[str] = Query(None)):
                     except Exception as metrics_error:
                         logger.warning(f"Failed to get session metrics: {metrics_error}")
 
+                # Ensure metrics exist with defaults
+                if not metrics:
+                    metrics = {
+                        "session_cost": 0.0,
+                        "session_tokens": 0,
+                        "individual_cost": 0.0,
+                        "individual_tokens": 0,
+                        "workflow_cost": 0.0,
+                        "workflow_tokens": 0
+                    }
+
                 return {
                     "status": "success",
-                    "chat_history": session_data,
+                    "chat_history": chat_history,
                     "metrics": metrics
                 }
             else:
@@ -620,12 +606,15 @@ async def get_session_metrics_endpoint(session_id: str, path: str = Query(...)):
 @router.delete("/sessions/{session_id}", response_model=dict)
 async def delete_session(session_id: str, path: Optional[str] = Query(None)):
     """
-    Delete a session.
-    
+    Delete a session from FileSessionManager and ProjectDB.
+
+    IMPORTANT: Metrics are preserved in MetricsDB for project tracking.
+    Only session chat history and metadata are removed.
+
     Args:
         session_id: Session ID
         path: Optional project path
-        
+
     Returns:
         Status message
     """
@@ -634,22 +623,30 @@ async def delete_session(session_id: str, path: Optional[str] = Query(None)):
         if path:
             try:
                 db = ProjectDB(path)
+                # Only deletes from sessions table, NOT from metrics
                 db.delete_session(session_id)
                 project_db_deleted = True
+                logger.info(f"Deleted session {session_id} from ProjectDB")
             except Exception as e:
-                logger.error(f"Error deleting from ProjectDB: {e}")
+                logger.warning(f"ProjectDB delete failed: {e}")
 
         from agents.multi_agent_manager import get_multi_agent_manager
         manager = get_multi_agent_manager()
-        
+
+        # Remove from FileSessionManager (chat history)
         manager_deleted = manager.delete_session(session_id)
-        
+        if manager_deleted:
+            logger.info(f"Deleted session {session_id} from FileSessionManager")
+
         if not manager_deleted and not project_db_deleted:
             raise HTTPException(status_code=404, detail="Session not found or could not be deleted")
-            
+
+        # DO NOT delete from MetricsDB - metrics persist for project tracking
+        # This is intentional to maintain historical project cost/usage data
+
         return {
             "status": "success",
-            "message": "Session deleted successfully"
+            "message": f"Session {session_id} deleted (metrics preserved)"
         }
     except HTTPException:
         raise

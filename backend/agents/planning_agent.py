@@ -22,6 +22,7 @@ from context.engine import ContextEngine
 from .models import OpenRouterModel
 from .config import AgentConfig
 from .metrics_tracker import TokenMetricsTracker
+from .db import ProjectDB
 from .tools import (
     # File system tools
     read_file,
@@ -103,6 +104,10 @@ class PlanningAgent:
         config = AgentConfig.get_openrouter_config()
         model_config = AgentConfig.get_model_config()
 
+        # Initialize state
+        self.db: Optional[ProjectDB] = None
+        self.current_session_id: Optional[str] = None
+
         # Override with provided values
         api_key_value = api_key if api_key else config["api_key"]
         if model_id:
@@ -117,9 +122,13 @@ class PlanningAgent:
         # Merge additional config
         model_config.update(kwargs)
 
-        # Initialize OpenRouter model with new signature
+        # Initialize OpenRouter model with metrics callback
         try:
-            self.model = OpenRouterModel(api_key_value, **model_config)
+            self.model = OpenRouterModel(
+                api_key_value,
+                metrics_callback=self._metrics_callback,
+                **model_config
+            )
             logger.info(f"Initialized OpenRouter model: {model_config.get('model_id')}")
         except Exception as e:
             logger.error(f"Failed to initialize model: {e}")
@@ -229,6 +238,43 @@ class PlanningAgent:
         )
 
         logger.info("Planning agent initialized successfully")
+
+    def set_project_path(self, project_path: str):
+        """Set the project path and initialize the database."""
+        try:
+            self.db = ProjectDB(project_path)
+            logger.info(f"ProjectDB initialized for path: {project_path}")
+        except Exception as e:
+            logger.error(f"Failed to initialize ProjectDB: {e}")
+
+    def _metrics_callback(self, cost: float, tokens: int, model_name: str,
+                         prompt_tokens: int = 0, completion_tokens: int = 0,
+                         message_id: Optional[str] = None):
+        """Callback for recording metrics from the model."""
+        if self.db and self.current_session_id:
+            try:
+                # Record basic session-level metric
+                self.db.record_metric(self.current_session_id, cost, tokens, model_name)
+
+                # Also record message-level metric if message_id provided
+                if message_id:
+                    self.db.record_message_metric(
+                        session_id=self.current_session_id,
+                        message_id=message_id,
+                        role="assistant",  # Metrics are for LLM responses
+                        cost=cost,
+                        tokens=tokens,
+                        model_name=model_name,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens
+                    )
+            except Exception as e:
+                logger.error(f"Failed to record metric: {e}")
+
+    def start_session(self, session_id: str):
+        """Start tracking a session for metrics."""
+        self.current_session_id = session_id
+        logger.info(f"Planning agent started tracking session: {session_id}")
 
     def _initialize_mcp_tools_sync(self):
         """
@@ -440,55 +486,12 @@ class PlanningAgent:
                         # Add to metrics dict for response
                         metrics["tool_calls"] = tool_calls_count
                         metrics["tool_errors"] = tool_errors_count
-                        
-                        # Store metrics in database
-                        from database import get_db_manager
-                        db_manager = get_db_manager()
-                        
-                        await db_manager.create_message_metrics(
-                            message_id=message_id,
-                            model_id=metrics.get("model_id", model_id),
-                            prompt_tokens=metrics.get("prompt_tokens", 0),
-                            completion_tokens=metrics.get("completion_tokens", 0),
-                            total_tokens=metrics.get("total_tokens", 0),
-                            estimated_cost=metrics.get("estimated_cost", 0.0),
-                            actual_cost=metrics.get("actual_cost"),
-                            session_id=session_id,
-                            project_id=project_id,
-                            response_time_ms=response_time_ms,
-                            stop_reason=metrics.get("stop_reason"),
-                            tool_calls_count=tool_calls_count,
-                            tool_errors_count=tool_errors_count
-                        )
 
-                        # Update session metrics if session_id is provided
-                        if session_id:
-                            await db_manager.update_session_metrics(
-                                session_id=session_id,
-                                prompt_tokens=metrics.get("prompt_tokens", 0),
-                                completion_tokens=metrics.get("completion_tokens", 0),
-                                total_tokens=metrics.get("total_tokens", 0),
-                                estimated_cost=metrics.get("estimated_cost", 0.0),
-                                model_id=metrics.get("model_id", model_id),
-                                actual_cost=metrics.get("actual_cost"),
-                                tool_errors_count=tool_errors_count
-                            )
-                        
-                        # Update project metrics if project_id is provided
-                        if project_id:
-                            await db_manager.update_project_metrics(
-                                project_id=project_id,
-                                prompt_tokens=metrics.get("prompt_tokens", 0),
-                                completion_tokens=metrics.get("completion_tokens", 0),
-                                total_tokens=metrics.get("total_tokens", 0),
-                                estimated_cost=metrics.get("estimated_cost", 0.0),
-                                actual_cost=metrics.get("actual_cost")
-                            )
-                        
-                        logger.info(f"Persisted metrics for message {message_id}")
+                        # Metrics are now recorded via _metrics_callback automatically
+                        logger.info(f"Metrics tracked for message {message_id}")
                 except Exception as e:
-                    logger.error(f"Failed to persist metrics: {e}")
-                    # Don't fail the request if metrics fail
+                    logger.error(f"Failed to track metrics: {e}")
+                    # Don't fail the request if metrics tracking fails
 
             return {
                 "plan": response_text,

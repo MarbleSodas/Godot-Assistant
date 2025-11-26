@@ -208,15 +208,15 @@ class MultiAgentManager:
             }
             self._save_session_metadata(session_id, metadata)
 
-            # NEW: Also save session to database if project_path is provided
+            # NEW: Initialize session in database if project_path is provided
             if project_path:
                 try:
                     db = ProjectDB(project_path)
-                    # Initialize session with empty chat history
-                    db.save_session(session_id, [])
-                    logger.info(f"Saved session {session_id} to database for project: {project_path}")
+                    # Initialize session metadata (chat history in FileSessionManager)
+                    db.save_session(session_id)
+                    logger.info(f"Initialized session {session_id} in database for project: {project_path}")
                 except Exception as db_error:
-                    logger.error(f"Failed to save session {session_id} to database: {db_error}")
+                    logger.error(f"Failed to initialize session {session_id} in database: {db_error}")
                     # Don't fail session creation if database save fails
 
             # Store project path for this session for later use
@@ -272,7 +272,7 @@ class MultiAgentManager:
 
     def get_session_chat_history(self, session_id: str) -> List[Dict[str, str]]:
         """
-        Extract chat history from FileSessionManager format.
+        Extract chat history from FileSessionManager using Strands API.
 
         Args:
             session_id: Session ID
@@ -281,91 +281,102 @@ class MultiAgentManager:
             List of messages in format: [{"role": "user", "content": "..."}, ...]
         """
         try:
-            session_path = os.path.join(self.storage_dir, f"session_{session_id}", "session.json")
-            if not os.path.exists(session_path):
-                logger.debug(f"Session file not found: {session_path}")
+            # Use FileSessionManager to load messages properly
+            session_manager = FileSessionManager(
+                session_id=session_id,
+                storage_dir=self.storage_dir
+            )
+
+            # Check if session exists
+            session_dir = os.path.join(self.storage_dir, f"session_{session_id}")
+            if not os.path.exists(session_dir):
+                logger.debug(f"Session directory not found: {session_dir}")
                 return []
 
-            with open(session_path, 'r', encoding='utf-8') as f:
-                session_data = json.load(f)
+            # Load session metadata to get agent IDs
+            session_data = session_manager.read_session(session_id)
+            if not session_data:
+                logger.debug(f"Session data not found for {session_id}")
+                return []
 
-            # Try different possible keys for messages
-            messages = []
-            if "messages" in session_data:
-                messages = session_data["messages"]
-            elif "conversation" in session_data:
-                messages = session_data["conversation"]
+            # Get all agents for this session
+            agent_ids = session_data.get("agent_ids", [])
+            if not agent_ids:
+                # Try to discover agent directories
+                agents_dir = os.path.join(session_dir, "agents")
+                if os.path.exists(agents_dir):
+                    agent_ids = [d.replace("agent_", "") for d in os.listdir(agents_dir)
+                               if d.startswith("agent_")]
 
-            # Transform to simple role/content format with metadata preservation
+            # Collect messages from all agents
             chat_history = []
-            for msg in messages:
-                if isinstance(msg, dict) and "role" in msg:
-                    role = msg.get("role")
-                    content = msg.get("content", "")
-                    if role and content:
-                        chat_history.append({
-                            "role": role,
-                            "content": content,
-                            # Preserve metadata fields if present
-                            "id": msg.get("id"),
-                            "timestamp": msg.get("timestamp"),
-                            "tokens": msg.get("tokens"),
-                            "promptTokens": msg.get("promptTokens"),
-                            "completionTokens": msg.get("completionTokens"),
-                            "cost": msg.get("cost"),
-                            "modelName": msg.get("modelName"),
-                            "generationTimeMs": msg.get("generationTimeMs"),
-                            "toolCalls": msg.get("toolCalls"),
-                            "plan": msg.get("plan"),
-                            "events": msg.get("events"),
-                            "workflowMetrics": msg.get("workflowMetrics")
-                        })
+            for agent_id in agent_ids:
+                try:
+                    # Use list_messages API to get all messages for this agent
+                    messages = session_manager.list_messages(
+                        session_id=session_id,
+                        agent_id=agent_id,
+                        offset=0,
+                        limit=1000  # Large limit to get all messages
+                    )
+
+                    # Transform to simple role/content format
+                    for msg in messages:
+                        if isinstance(msg, dict) and "role" in msg:
+                            role = msg.get("role")
+                            content = msg.get("content", "")
+
+                            # Handle different content formats
+                            if isinstance(content, list):
+                                # Content is array of content blocks
+                                text_parts = []
+                                for block in content:
+                                    if isinstance(block, dict):
+                                        if block.get("type") == "text":
+                                            text_parts.append(block.get("text", ""))
+                                    elif isinstance(block, str):
+                                        text_parts.append(block)
+                                content = "\n".join(text_parts)
+                            elif not isinstance(content, str):
+                                content = str(content)
+
+                            if role and content:
+                                chat_history.append({
+                                    "role": role,
+                                    "content": content,
+                                    # Preserve metadata if present
+                                    "id": msg.get("id"),
+                                    "timestamp": msg.get("timestamp") or msg.get("created_at"),
+                                    "tokens": msg.get("tokens"),
+                                    "cost": msg.get("cost"),
+                                    "model_name": msg.get("model_name")
+                                })
+                except Exception as e:
+                    logger.error(f"Failed to load messages for agent {agent_id}: {e}")
+                    continue
+
+            # Sort by timestamp if available
+            chat_history.sort(key=lambda m: m.get("timestamp", ""))
 
             logger.debug(f"Loaded {len(chat_history)} messages for session {session_id}")
             return chat_history
+
         except Exception as e:
             logger.error(f"Failed to load chat history for {session_id}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return []
 
-    async def _save_user_message_immediate(self, session_id: str, user_message: str):
-        """Immediately save user message to FileSessionManager."""
-        try:
-            # Get the shared session for this session_id
-            if session_id in self._active_graphs:
-                shared_session = self._active_graphs[session_id]["shared_session"]
-
-                # Add user message to session immediately
-                await shared_session.add_message({
-                    "role": "user",
-                    "content": user_message,
-                    "timestamp": datetime.now().isoformat(),
-                    "id": f"user-{int(time.time() * 1000)}"
-                })
-
-                logger.info(f"Saved user message immediately for session {session_id}")
-
-        except Exception as e:
-            logger.error(f"Failed to save user message immediately: {e}")
 
     async def _save_assistant_response_complete(self, session_id: str):
-        """Save complete assistant response to FileSessionManager and sync to ProjectDB."""
+        """Mark session completion (FileSessionManager handles persistence automatically)."""
         try:
-            # FileSessionManager already has the conversation (handled by Strands)
-            # Now sync chat history to ProjectDB for session listing
-            if hasattr(self, '_session_project_paths') and session_id in self._session_project_paths:
-                project_path = self._session_project_paths[session_id]
-
-                # Get complete chat history from FileSessionManager
-                chat_history = await self.get_session_chat_history(session_id)
-
-                # Update ProjectDB session metadata (for session listing)
-                db = ProjectDB(project_path)
-                db.save_session(session_id, chat_history)
-
-                logger.info(f"Synced complete session {session_id} to ProjectDB")
+            # FileSessionManager already has the conversation (handled by Strands hooks)
+            # No need to manually sync - Strands persists via session manager hooks
+            logger.info(f"Session {session_id} complete (persisted by FileSessionManager)")
 
         except Exception as e:
-            logger.error(f"Failed to save assistant response: {e}")
+            logger.error(f"Failed to mark session completion: {e}")
 
     def list_sessions(self) -> Dict[str, Dict[str, Any]]:
         """
@@ -623,8 +634,8 @@ class MultiAgentManager:
         if project_path:
             self._session_project_paths[session_id] = project_path
 
-        # Save user message immediately to prevent data loss
-        await self._save_user_message_immediate(session_id, message)
+        # Strands session manager handles message persistence automatically via hooks
+        # No need to manually save - messages are persisted as they're added to the conversation
 
         # Setup executor agent with context
         try:
@@ -679,6 +690,26 @@ class MultiAgentManager:
                         # Accumulate metrics if this is a metrics event
                         if transformed["type"] == "metrics":
                             accumulate_workflow_metrics(session_id, transformed, self, "execution")
+
+                            # Also save individual message metrics to database
+                            if project_path and session_id in self._session_project_paths:
+                                try:
+                                    db = ProjectDB(self._session_project_paths[session_id])
+                                    metrics_data = transformed.get("data", {})
+
+                                    db.record_message_metric(
+                                        session_id=session_id,
+                                        message_id=metrics_data.get("message_id", f"msg-{int(time.time()*1000)}"),
+                                        role="assistant",
+                                        cost=metrics_data.get("cost", 0.0),
+                                        tokens=metrics_data.get("total_tokens", 0),
+                                        model_name=metrics_data.get("model_id", "unknown"),
+                                        prompt_tokens=metrics_data.get("input_tokens", 0),
+                                        completion_tokens=metrics_data.get("output_tokens", 0)
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Failed to save individual message metric: {e}")
+
                         yield transformed
                     
             else:
@@ -694,6 +725,25 @@ class MultiAgentManager:
                         # Accumulate metrics if this is a metrics event
                         if transformed["type"] == "metrics":
                             accumulate_workflow_metrics(session_id, transformed, self, "planning")
+
+                            # Also save individual message metrics to database
+                            if project_path and session_id in self._session_project_paths:
+                                try:
+                                    db = ProjectDB(self._session_project_paths[session_id])
+                                    metrics_data = transformed.get("data", {})
+
+                                    db.record_message_metric(
+                                        session_id=session_id,
+                                        message_id=metrics_data.get("message_id", f"msg-{int(time.time()*1000)}"),
+                                        role="assistant",
+                                        cost=metrics_data.get("cost", 0.0),
+                                        tokens=metrics_data.get("total_tokens", 0),
+                                        model_name=metrics_data.get("model_id", "unknown"),
+                                        prompt_tokens=metrics_data.get("input_tokens", 0),
+                                        completion_tokens=metrics_data.get("output_tokens", 0)
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Failed to save individual message metric: {e}")
 
                         # Collect text output to detect plan completion
                         if transformed["type"] == "data" and "text" in transformed.get("data", {}):
@@ -754,6 +804,25 @@ Please proceed with implementation."""
                             # Accumulate metrics if this is a metrics event
                             if transformed["type"] == "metrics":
                                 accumulate_workflow_metrics(session_id, transformed, self, "execution")
+
+                                # Also save individual message metrics to database
+                                if project_path and session_id in self._session_project_paths:
+                                    try:
+                                        db = ProjectDB(self._session_project_paths[session_id])
+                                        metrics_data = transformed.get("data", {})
+
+                                        db.record_message_metric(
+                                            session_id=session_id,
+                                            message_id=metrics_data.get("message_id", f"msg-{int(time.time()*1000)}"),
+                                            role="assistant",
+                                            cost=metrics_data.get("cost", 0.0),
+                                            tokens=metrics_data.get("total_tokens", 0),
+                                            model_name=metrics_data.get("model_id", "unknown"),
+                                            prompt_tokens=metrics_data.get("input_tokens", 0),
+                                            completion_tokens=metrics_data.get("output_tokens", 0)
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"Failed to save individual message metric: {e}")
 
                             # Track major operations as "steps" dynamically
                             if transformed.get("type") == "tool_use":

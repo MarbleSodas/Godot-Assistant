@@ -201,11 +201,27 @@ class ExecutorAgent:
         except Exception as e:
             logger.error(f"Failed to initialize ProjectDB: {e}")
 
-    def _metrics_callback(self, cost: float, tokens: int, model_name: str):
+    def _metrics_callback(self, cost: float, tokens: int, model_name: str,
+                         prompt_tokens: int = 0, completion_tokens: int = 0,
+                         message_id: Optional[str] = None):
         """Callback for recording metrics from the model."""
         if self.db and self.current_session_id:
             try:
+                # Record basic session-level metric
                 self.db.record_metric(self.current_session_id, cost, tokens, model_name)
+
+                # Also record message-level metric if message_id provided
+                if message_id:
+                    self.db.record_message_metric(
+                        session_id=self.current_session_id,
+                        message_id=message_id,
+                        role="assistant",  # Metrics are for LLM responses
+                        cost=cost,
+                        tokens=tokens,
+                        model_name=model_name,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens
+                    )
             except Exception as e:
                 logger.error(f"Failed to record metric: {e}")
 
