@@ -10,6 +10,7 @@ Provides endpoints for interacting with the planning agent:
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Optional, AsyncIterable
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -403,43 +404,101 @@ async def list_sessions(path: Optional[str] = Query(None)):
         List of sessions for the specified project
     """
     try:
-        # Require path for security/isolation
-        if not path:
-            logger.info("No project path provided, returning empty session list")
-            return {"status": "success", "sessions": {}}
+        logger.info(f"Listing sessions with path: {path}")
 
-        # Only load from ProjectDB for the specified path
-        db = ProjectDB(path)
-        db_sessions = db.get_all_sessions()
+        # Get sessions from FileSessionManager (primary source)
+        from agents.multi_agent_manager import get_multi_agent_manager
+        multi_agent_manager = get_multi_agent_manager()
+        fs_sessions = multi_agent_manager.list_sessions()
+        logger.info(f"Found {len(fs_sessions)} sessions from FileSessionManager")
+
+        if not path:
+            # For development/testing, use current working directory as default
+            logger.warning("No project path provided, using current working directory as default")
+            path = os.getcwd()
 
         sessions_dict = {}
-        for session in db_sessions:
-            session_id = session["id"]
-            title = _extract_title_from_chat_history(session.get("chat_history", []))
 
-            sessions_dict[session_id] = {
-                "session_id": session_id,
-                "title": title,
-                "date": session["created_at"],
-                "active": False,
-                "is_running": False,
-                "metadata": {
-                    "created_at": session["created_at"],
-                    "last_updated": session["last_updated"],
-                    "title": title
-                },
-                "path": f"database://{session_id}"
-            }
+        logger.info(f"Processing {len(fs_sessions)} sessions from FileSessionManager")
 
-        # Always add metrics (with defaults if unavailable)
+        # Process FileSessionManager sessions
+        for session_id, session_data in fs_sessions.items():
+            logger.debug(f"Processing session: {session_id}")
+
+            try:
+                # Extract title from session metadata or conversation
+                title = session_data.get("metadata", {}).get("title", f"Session {session_id}")
+                if not title or title == f"Session {session_id}":
+                    # Try to extract from conversation
+                    chat_history = session_data.get("chat_history", [])
+                    title = _extract_title_from_chat_history(chat_history)
+                    if not title:
+                        title = f"Session {session_id}"
+
+                # Get session date from FileSessionManager
+                session_date = session_data.get("session_type") == "AGENT" and session_data.get("created_at")
+
+                sessions_dict[session_id] = {
+                    "session_id": session_id,
+                    "title": title,
+                    "date": session_date,
+                    "active": False,
+                    "is_running": False,
+                    "metadata": {
+                        "created_at": session_date,
+                        "title": title,
+                        **session_data.get("metadata", {})
+                    },
+                    "path": f"filesession://{session_id}"
+                }
+                logger.debug(f"Successfully processed session: {session_id} with title: {title}")
+
+            except Exception as e:
+                logger.error(f"Error processing session {session_id}: {e}")
+                continue
+
+        # SECONDARY SOURCE: Enrich with ProjectDB metadata where available
+        try:
+            logger.debug(f"Enriching sessions with ProjectDB data using path: {path}")
+            db = ProjectDB(path)
+            db_sessions = db.get_all_sessions()
+            logger.debug(f"Found {len(db_sessions)} sessions in ProjectDB")
+
+            # Create mapping of session_id -> db_session for quick lookup
+            db_session_map = {session["id"]: session for session in db_sessions}
+
+            # Enrich FileSessionManager sessions with ProjectDB data
+            enriched_count = 0
+            for session_id, session_data in sessions_dict.items():
+                if session_id in db_session_map:
+                    db_session = db_session_map[session_id]
+                    # Merge ProjectDB metadata with FileSessionManager data
+                    session_data["metadata"].update({
+                        "last_updated": db_session.get("last_updated"),
+                        "project_path": path
+                    })
+                    enriched_count += 1
+            logger.debug(f"Enriched {enriched_count} sessions with ProjectDB data")
+
+        except Exception as e:
+            logger.warning(f"Failed to enrich sessions with ProjectDB data: {e}")
+
+        # Add metrics from ProjectDB (with defaults if unavailable)
         session_ids = list(sessions_dict.keys())
         try:
+            logger.debug(f"Fetching metrics for {len(session_ids)} sessions")
+            db = ProjectDB(path)
             metrics_map = db.get_metrics_for_sessions(session_ids)
+
+            metrics_count = 0
             for sid, sdata in sessions_dict.items():
                 sdata["metrics"] = metrics_map.get(sid, {
                     "session_cost": 0.0,
                     "session_tokens": 0
                 })
+                if metrics_map.get(sid):
+                    metrics_count += 1
+            logger.debug(f"Added metrics for {metrics_count} sessions")
         except Exception as e:
             logger.error(f"Metrics fetch failed: {e}")
             for sid, sdata in sessions_dict.items():
@@ -448,12 +507,12 @@ async def list_sessions(path: Optional[str] = Query(None)):
                     "session_tokens": 0
                 }
 
-        logger.info(f"Retrieved {len(sessions_dict)} sessions for project: {path}")
+        logger.info(f"Successfully returning {len(sessions_dict)} sessions for project: {path}")
         return {"status": "success", "sessions": sessions_dict}
 
     except Exception as e:
-        logger.error(f"List sessions error: {e}")
-        return {"status": "success", "sessions": {}}
+        logger.error(f"Unexpected error in list_sessions: {e}", exc_info=True)
+        return {"status": "error", "sessions": {}, "message": str(e)}
 
 
 @router.get("/sessions/{session_id}", response_model=dict)
@@ -521,6 +580,54 @@ async def get_session(session_id: str, path: Optional[str] = Query(None)):
     except Exception as e:
         logger.error(f"Failed to load session {session_id}: {e}")
         return {"status": "error", "message": f"Unable to load session: {str(e)}"}
+
+
+@router.get("/sessions/{session_id}/metrics", response_model=dict)
+async def get_session_metrics(session_id: str):
+    """
+    Retrieve session metrics ledger for display.
+
+    Returns cumulative cost, token count, and run history from the agent.state
+    metrics ledger. This enables UI to display "Previous Cost: $X.XX" on session resume.
+
+    Args:
+        session_id: Session ID to retrieve metrics for
+
+    Returns:
+        Dictionary containing:
+        - session_id: The session identifier
+        - total_cost: Cumulative cost across all runs
+        - total_tokens: Cumulative token count
+        - run_count: Number of runs in history
+        - recent_runs: Last 10 runs with details
+    """
+    try:
+        from agents.planning_agent import get_planning_agent
+
+        planning_agent = get_planning_agent()
+
+        # Use the new get_session_metrics method
+        ledger = planning_agent.get_session_metrics(session_id=session_id)
+
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "total_cost": ledger.get('total_cost', 0.0),
+            "total_tokens": ledger.get('total_tokens', 0),
+            "run_count": len(ledger.get('run_history', [])),
+            "recent_runs": ledger.get('run_history', [])[-10:]  # Last 10 runs
+        }
+    except Exception as e:
+        logger.error(f"Failed to retrieve metrics for session {session_id}: {e}")
+        return {
+            "status": "error",
+            "message": f"Unable to retrieve metrics: {str(e)}",
+            "session_id": session_id,
+            "total_cost": 0.0,
+            "total_tokens": 0,
+            "run_count": 0,
+            "recent_runs": []
+        }
 
 
 @router.post("/sessions/{session_id}/restore", response_model=dict)

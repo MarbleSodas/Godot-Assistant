@@ -25,10 +25,14 @@ from strands import Agent
 from strands.multiagent.graph import Graph, GraphBuilder
 from strands.session.file_session_manager import FileSessionManager
 
-from .planning_agent import get_planning_agent
-from .executor_agent import get_executor_agent
-from .config import AgentConfig
-from .db import ProjectDB
+from agents.planning_agent import get_planning_agent
+from agents.executor_agent import get_executor_agent
+from agents.config import AgentConfig
+from agents.db import ProjectDB
+from agents.global_sequence_manager import GlobalSequenceManager
+from agents.streaming_metrics_tracker import StreamingMetricsTracker
+from agents.metrics_buffer import MetricsBuffer
+from agents.event_utils import handle_session_cancellation, recover_session_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +124,19 @@ class MultiAgentManager:
         """
         self.storage_dir = storage_dir or os.path.join(os.getcwd(), ".godoty_sessions")
         os.makedirs(self.storage_dir, exist_ok=True)
+
+        # Initialize GlobalSequenceManager for proper message ordering across agents
+        self.global_sequence_manager = GlobalSequenceManager(self.storage_dir)
+
+        # Initialize StreamingMetricsTracker for partial metrics collection
+        self.streaming_metrics_tracker = StreamingMetricsTracker()
+
+        # Initialize MetricsBuffer for recovery on cancellation
+        self.metrics_buffer = MetricsBuffer(self.storage_dir)
+
+        # Register recovery callback with metrics buffer
+        self.metrics_buffer.register_recovery_callback(self._recover_metrics_callback)
+
         # Store graphs as a dict of dicts: session_id -> {"planning": Graph, "fast": Graph}
         self._active_graphs: Dict[str, Dict[str, Graph]] = {}
         # Store active asyncio tasks: session_id -> asyncio.Task
@@ -128,7 +145,14 @@ class MultiAgentManager:
         self._workflow_metrics: Dict[str, WorkflowMetricsAccumulator] = {}
         # Store project paths per session for database persistence
         self._session_project_paths: Dict[str, str] = {}
+        # Store agent IDs per session for sequence tracking
+        self._session_agent_ids: Dict[str, Dict[str, str]] = {}  # session_id -> {agent_type: agent_id}
+        # Store active tracking sessions for metrics
+        self._active_tracking_sessions: Dict[str, str] = {}  # session_id -> model_name
+
         logger.info(f"MultiAgentManager initialized with storage: {self.storage_dir}")
+        logger.info("GlobalSequenceManager initialized for cross-agent message ordering")
+        logger.info("StreamingMetricsTracker and MetricsBuffer initialized for partial metrics handling")
 
     def create_session(self, session_id: str, title: Optional[str] = None, project_path: Optional[str] = None) -> str:
         """
@@ -184,10 +208,38 @@ class MultiAgentManager:
             builder_executor.set_execution_timeout(600)  # Longer timeout for execution
             executor_graph = builder_executor.build()
 
+            # Explicitly initialize agents with session manager to enable message persistence
+            session_manager.initialize(planning_agent.agent)
+            session_manager.initialize(executor_agent.agent)
+            logger.info(f"Connected agents to session manager for session {session_id}")
+
+            # CRITICAL: Register session manager hooks directly with each agent
+            # This fixes the core issue where Graph execution bypasses normal hook registration
+            planning_agent.agent.hooks.add_hook(session_manager)
+            executor_agent.agent.hooks.add_hook(session_manager)
+
+            # Verify hook registration is successful
+            planning_hooks_registered = planning_agent.agent.hooks.has_callbacks()
+            executor_hooks_registered = executor_agent.agent.hooks.has_callbacks()
+            logger.info(f"Hook registration status - Planning: {planning_hooks_registered}, Executor: {executor_hooks_registered}")
+
+            # Track agent IDs for sequence management
+            planning_agent_id = getattr(planning_agent.agent, 'agent_id', f"planning_{session_id}")
+            executor_agent_id = getattr(executor_agent.agent, 'agent_id', f"executor_{session_id}")
+
+            self._session_agent_ids[session_id] = {
+                "planning": planning_agent_id,
+                "execution": executor_agent_id
+            }
+
             self._active_graphs[session_id] = {
                 "planning": planning_graph,
                 "executor": executor_graph,
-                "shared_session": session_manager  # Store reference for debugging/access
+                "shared_session": session_manager,  # Store reference for debugging/access
+                "agent_ids": {
+                    "planning": planning_agent_id,
+                    "execution": executor_agent_id
+                }
             }
 
             # Process title if provided (e.g., from user prompt)
@@ -208,20 +260,20 @@ class MultiAgentManager:
             }
             self._save_session_metadata(session_id, metadata)
 
-            # NEW: Initialize session in database if project_path is provided
-            if project_path:
-                try:
-                    db = ProjectDB(project_path)
-                    # Initialize session metadata (chat history in FileSessionManager)
-                    db.save_session(session_id)
-                    logger.info(f"Initialized session {session_id} in database for project: {project_path}")
-                except Exception as db_error:
-                    logger.error(f"Failed to initialize session {session_id} in database: {db_error}")
-                    # Don't fail session creation if database save fails
+            # Initialize session in database (use default path if none provided)
+            try:
+                # Use provided project_path or default to current working directory
+                db_project_path = project_path or os.getcwd()
+                db = ProjectDB(db_project_path)
+                # Initialize session metadata (chat history in FileSessionManager)
+                db.save_session(session_id)
+                logger.info(f"Initialized session {session_id} in database for project: {db_project_path}")
+            except Exception as db_error:
+                logger.error(f"Failed to initialize session {session_id} in database: {db_error}")
+                # Don't fail session creation if database save fails
 
             # Store project path for this session for later use
-            if project_path:
-                self._session_project_paths[session_id] = project_path
+            self._session_project_paths[session_id] = db_project_path
 
             logger.info(f"Created session {session_id} with title: {processed_title}")
             return session_id
@@ -240,47 +292,87 @@ class MultiAgentManager:
         Returns:
             Session details or None if not found
         """
-        # Check if session file exists even if not in memory
-        session_path = os.path.join(self.storage_dir, f"{session_id}.json")
-        if os.path.exists(session_path):
+        try:
+            # Check if session exists in FileSessionManager structure
+            session_dir = os.path.join(self.storage_dir, f"session_{session_id}")
+            session_path = os.path.join(session_dir, "session.json")
+
+            # Also check for legacy flat file structure
+            legacy_session_path = os.path.join(self.storage_dir, f"{session_id}.json")
+
+            if os.path.exists(session_path):
+                logger.debug(f"Found session directory structure for {session_id}")
+                actual_session_path = session_path
+            elif os.path.exists(legacy_session_path):
+                logger.debug(f"Found legacy session file for {session_id}")
+                actual_session_path = legacy_session_path
+            else:
+                logger.debug(f"Session not found: {session_id}")
+                return None
+
+            # Load session metadata
             metadata = self._load_session_metadata(session_id)
 
             # If no meaningful title in metadata, try to get from conversation
             title = metadata.get("title")
             if not title or title == f"Session {session_id}":
-                first_message = self.get_first_user_message(session_id)
-                if first_message:
-                    # Clean up the content for display
-                    title = first_message.strip()
-                    # Replace newlines with spaces
-                    title = ' '.join(title.split())
-                    # Truncate to reasonable length for title
-                    if len(title) > 50:
-                        title = title[:50] + "..."
-                    # Update metadata with the extracted title
-                    metadata["title"] = title
-                    self._save_session_metadata(session_id, metadata)
+                try:
+                    first_message = self.get_first_user_message(session_id)
+                    if first_message:
+                        # Clean up the content for display
+                        title = first_message.strip()
+                        # Replace newlines with spaces
+                        title = ' '.join(title.split())
+                        # Truncate to reasonable length for title
+                        if len(title) > 50:
+                            title = title[:50] + "..."
+                        # Update metadata with the extracted title
+                        metadata["title"] = title
+                        self._save_session_metadata(session_id, metadata)
+                        logger.debug(f"Extracted title from first message: {title}")
+                except Exception as e:
+                    logger.warning(f"Failed to extract title from conversation for session {session_id}: {e}")
+                    # Keep default title if extraction fails
+                    metadata["title"] = metadata.get("title", f"Session {session_id}")
 
             return {
                 "session_id": session_id,
-                "path": session_path,
+                "path": actual_session_path,
                 "active": session_id in self._active_graphs,
                 "is_running": session_id in self._active_tasks,
                 "metadata": metadata
             }
-        return None
 
-    def get_session_chat_history(self, session_id: str) -> List[Dict[str, str]]:
+        except Exception as e:
+            logger.error(f"Error getting session {session_id}: {e}")
+            return None
+
+    def get_session_chat_history(self, session_id: str, format: str = "openai") -> List[Dict[str, Any]]:
         """
-        Extract chat history from FileSessionManager using Strands API.
+        Extract chat history from FileSessionManager using global sequence ordering.
+
+        This method uses the GlobalSequenceManager to ensure proper chronological
+        ordering of messages across planning and execution agents.
 
         Args:
             session_id: Session ID
+            format: Output format ("openai" for role/content, "full" for complete data)
 
         Returns:
-            List of messages in format: [{"role": "user", "content": "..."}, ...]
+            List of messages in proper chronological order
         """
         try:
+            # First try to get ordered messages from GlobalSequenceManager
+            ordered_messages = self.global_sequence_manager.get_ordered_messages(session_id)
+
+            if ordered_messages:
+                # We have sequence information, use it
+                logger.debug(f"Using global sequence ordering for session {session_id}")
+                return self._format_ordered_messages(ordered_messages, format)
+
+            # Fallback to traditional method for backward compatibility
+            logger.debug(f"No global sequence data for session {session_id}, using fallback method")
+
             # Use FileSessionManager to load messages properly
             session_manager = FileSessionManager(
                 session_id=session_id,
@@ -300,7 +392,8 @@ class MultiAgentManager:
                 return []
 
             # Get all agents for this session
-            agent_ids = session_data.get("agent_ids", [])
+            # Session dataclass doesn't contain agent_ids, start with empty list
+            agent_ids = []
             if not agent_ids:
                 # Try to discover agent directories
                 agents_dir = os.path.join(session_dir, "agents")
@@ -309,7 +402,7 @@ class MultiAgentManager:
                                if d.startswith("agent_")]
 
             # Collect messages from all agents
-            chat_history = []
+            agent_messages = {}
             for agent_id in agent_ids:
                 try:
                     # Use list_messages API to get all messages for this agent
@@ -320,52 +413,165 @@ class MultiAgentManager:
                         limit=1000  # Large limit to get all messages
                     )
 
-                    # Transform to simple role/content format
+                    # Store messages by agent for reconstruction
+                    agent_messages[agent_id] = []
                     for msg in messages:
                         if isinstance(msg, dict) and "role" in msg:
-                            role = msg.get("role")
-                            content = msg.get("content", "")
+                            agent_messages[agent_id].append(msg)
 
-                            # Handle different content formats
-                            if isinstance(content, list):
-                                # Content is array of content blocks
-                                text_parts = []
-                                for block in content:
-                                    if isinstance(block, dict):
-                                        if block.get("type") == "text":
-                                            text_parts.append(block.get("text", ""))
-                                    elif isinstance(block, str):
-                                        text_parts.append(block)
-                                content = "\n".join(text_parts)
-                            elif not isinstance(content, str):
-                                content = str(content)
-
-                            if role and content:
-                                chat_history.append({
-                                    "role": role,
-                                    "content": content,
-                                    # Preserve metadata if present
-                                    "id": msg.get("id"),
-                                    "timestamp": msg.get("timestamp") or msg.get("created_at"),
-                                    "tokens": msg.get("tokens"),
-                                    "cost": msg.get("cost"),
-                                    "model_name": msg.get("model_name")
-                                })
                 except Exception as e:
                     logger.error(f"Failed to load messages for agent {agent_id}: {e}")
                     continue
 
-            # Sort by timestamp if available
-            chat_history.sort(key=lambda m: m.get("timestamp", ""))
+            # Use GlobalSequenceManager to reconstruct order
+            reconstructed_messages = self.global_sequence_manager.reconstruct_session_order(
+                session_id, agent_messages
+            )
 
-            logger.debug(f"Loaded {len(chat_history)} messages for session {session_id}")
-            return chat_history
+            # Format and return messages
+            if format == "openai":
+                return self._format_messages_openai(reconstructed_messages)
+            else:
+                return reconstructed_messages
 
         except Exception as e:
             logger.error(f"Failed to load chat history for {session_id}: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return []
+
+    def _format_ordered_messages(self, ordered_messages: List[Dict[str, Any]], format: str) -> List[Dict[str, Any]]:
+        """
+        Format messages from GlobalSequenceManager into the requested format.
+
+        Args:
+            ordered_messages: Messages with global sequence ordering
+            format: Output format ("openai" or "full")
+
+        Returns:
+            Formatted messages
+        """
+        formatted_messages = []
+
+        for msg_info in ordered_messages:
+            # For now, we need to load the actual message content from FileSessionManager
+            # In a future enhancement, we could store the full message content in the sequence manager
+            try:
+                session_manager = FileSessionManager(
+                    session_id=msg_info["session_id"],
+                    storage_dir=self.storage_dir
+                )
+
+                messages = session_manager.list_messages(
+                    session_id=msg_info["session_id"],
+                    agent_id=msg_info["agent_id"],
+                    offset=0,
+                    limit=1000
+                )
+
+                # Find the specific message by timestamp or other criteria
+                for msg in messages:
+                    if isinstance(msg, dict):
+                        msg_timestamp = msg.get("timestamp") or msg.get("created_at", 0)
+                        if abs(msg_timestamp - msg_info["timestamp"]) < 1:  # Within 1 second
+                            if format == "openai":
+                                formatted_msg = self._convert_message_to_openai(msg)
+                                formatted_msg["global_sequence"] = msg_info["global_sequence"]
+                                formatted_messages.append(formatted_msg)
+                            else:
+                                msg["global_sequence"] = msg_info["global_sequence"]
+                                formatted_messages.append(msg)
+                            break
+
+            except Exception as e:
+                logger.error(f"Failed to format message {msg_info}: {e}")
+                continue
+
+        return formatted_messages
+
+    def _format_messages_openai(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Convert messages to OpenAI format (role/content).
+
+        Args:
+            messages: Raw messages from FileSessionManager
+
+        Returns:
+            Messages in OpenAI format
+        """
+        openai_messages = []
+
+        for msg in messages:
+            if isinstance(msg, dict) and "role" in msg:
+                role = msg.get("role")
+                content = msg.get("content", "")
+
+                # Handle different content formats
+                if isinstance(content, list):
+                    # Content is array of content blocks
+                    text_parts = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text":
+                                text_parts.append(block.get("text", ""))
+                        elif isinstance(block, str):
+                            text_parts.append(block)
+                    content = "\n".join(text_parts)
+                elif not isinstance(content, str):
+                    content = str(content)
+
+                if role and content:
+                    openai_msg = {
+                        "role": role,
+                        "content": content,
+                        # Preserve metadata if present
+                        "id": msg.get("id"),
+                        "timestamp": msg.get("timestamp") or msg.get("created_at"),
+                        "tokens": msg.get("tokens"),
+                        "cost": msg.get("cost"),
+                        "model_name": msg.get("model_name")
+                    }
+                    openai_messages.append(openai_msg)
+
+        return openai_messages
+
+    def _convert_message_to_openai(self, msg: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Convert a single message to OpenAI format.
+
+        Args:
+            msg: Raw message
+
+        Returns:
+            Message in OpenAI format
+        """
+        role = msg.get("role")
+        content = msg.get("content", "")
+
+        # Handle different content formats
+        if isinstance(content, list):
+            # Content is array of content blocks
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    text_parts.append(block)
+            content = "\n".join(text_parts)
+        elif not isinstance(content, str):
+            content = str(content)
+
+        return {
+            "role": role,
+            "content": content,
+            # Preserve metadata if present
+            "id": msg.get("id"),
+            "timestamp": msg.get("timestamp") or msg.get("created_at"),
+            "tokens": msg.get("tokens"),
+            "cost": msg.get("cost"),
+            "model_name": msg.get("model_name")
+        }
 
 
     async def _save_assistant_response_complete(self, session_id: str):
@@ -386,15 +592,49 @@ class MultiAgentManager:
             Dictionary of session_id to session details
         """
         sessions = {}
-        if os.path.exists(self.storage_dir):
-            for filename in os.listdir(self.storage_dir):
-                if filename.endswith(".json") and not filename.endswith("_metadata.json"):
-                    session_id = filename[:-5]
+
+        try:
+            if not os.path.exists(self.storage_dir):
+                logger.warning(f"Storage directory does not exist: {self.storage_dir}")
+                return sessions
+
+            logger.info(f"Scanning for sessions in: {self.storage_dir}")
+
+            # Look for session directories (FileSessionManager structure)
+            for item_name in os.listdir(self.storage_dir):
+                item_path = os.path.join(self.storage_dir, item_name)
+
+                # Check if this is a session directory
+                if os.path.isdir(item_path) and item_name.startswith("session_"):
+                    # Extract session ID from directory name
+                    session_id = item_name[8:]  # Remove "session_" prefix
+                    logger.debug(f"Found session directory: {item_name} -> session_id: {session_id}")
+
                     session = self.get_session(session_id)
                     # Filter hidden sessions
                     if session and not session.get("metadata", {}).get("is_hidden", False):
                         sessions[session_id] = session
-        return sessions
+                    else:
+                        logger.debug(f"Skipping hidden or invalid session: {session_id}")
+
+                # Also check for legacy flat session files
+                elif (os.path.isfile(item_path) and
+                      item_name.endswith(".json") and
+                      not item_name.endswith("_metadata.json")):
+                    session_id = item_name[:-5]  # Remove .json extension
+                    logger.debug(f"Found legacy session file: {item_name} -> session_id: {session_id}")
+
+                    session = self.get_session(session_id)
+                    # Filter hidden sessions
+                    if session and not session.get("metadata", {}).get("is_hidden", False):
+                        sessions[session_id] = session
+
+            logger.info(f"Found {len(sessions)} visible sessions")
+            return sessions
+
+        except Exception as e:
+            logger.error(f"Error listing sessions: {e}")
+            return sessions
 
     def hide_session(self, session_id: str) -> bool:
         """
@@ -670,9 +910,12 @@ class MultiAgentManager:
         if mode == "planning":
             self._workflow_metrics[session_id] = WorkflowMetricsAccumulator(session_id)
 
+        # Initialize metrics tracking for this session
+        self._active_tracking_sessions[session_id] = "unknown"  # Will be updated when we know the model
+
         try:
             # Import shared event utility
-            from .event_utils import transform_strands_event, accumulate_workflow_metrics
+            from agents.event_utils import transform_strands_event, accumulate_workflow_metrics
 
             if mode == "fast":
                 # --- Fast Mode: Direct execution with session support ---
@@ -687,8 +930,18 @@ class MultiAgentManager:
                     # Transform event with execution agent type
                     transformed = transform_strands_event(event, agent_type="execution", session_id=session_id)
                     if transformed:
-                        # Accumulate metrics if this is a metrics event
-                        if transformed["type"] == "metrics":
+                        # Update model tracking if we get model information
+                        if transformed.get("type") == "metrics":
+                            model_id = transformed.get("data", {}).get("model_id", "unknown")
+                            if self._active_tracking_sessions.get(session_id) == "unknown":
+                                self._active_tracking_sessions[session_id] = model_id
+                                # Start streaming metrics tracking
+                                self.streaming_metrics_tracker.start_session_tracking(session_id, model_id)
+
+                            # Accumulate partial metrics in streaming tracker
+                            self.streaming_metrics_tracker.accumulate_partial_usage(event, session_id)
+
+                            # Accumulate metrics if this is a metrics event
                             accumulate_workflow_metrics(session_id, transformed, self, "execution")
 
                             # Also save individual message metrics to database
@@ -696,6 +949,9 @@ class MultiAgentManager:
                                 try:
                                     db = ProjectDB(self._session_project_paths[session_id])
                                     metrics_data = transformed.get("data", {})
+
+                                    # Get current partial metrics from tracker
+                                    partial_metrics = self.streaming_metrics_tracker.get_latest_metrics(session_id)
 
                                     db.record_message_metric(
                                         session_id=session_id,
@@ -707,6 +963,17 @@ class MultiAgentManager:
                                         prompt_tokens=metrics_data.get("input_tokens", 0),
                                         completion_tokens=metrics_data.get("output_tokens", 0)
                                     )
+
+                                    # Buffer partial metrics for recovery
+                                    if partial_metrics and not partial_metrics.is_complete:
+                                        self.metrics_buffer.add_metric(
+                                            session_id=session_id,
+                                            message_id=metrics_data.get("message_id", f"partial-{int(time.time()*1000)}"),
+                                            agent_type="execution",
+                                            metrics=partial_metrics,
+                                            is_finalized=False
+                                        )
+
                                 except Exception as e:
                                     logger.error(f"Failed to save individual message metric: {e}")
 
@@ -718,12 +985,31 @@ class MultiAgentManager:
                 submitted_plan = None
                 planning_output = []  # Collect text output to detect execution plan
 
+                # CRITICAL: Verify hooks are active before execution
+                if not self._verify_agent_hooks(session_id):
+                    logger.error(f"Agent hooks verification failed for session {session_id}. Message persistence may not work.")
+                    yield {
+                        "type": "error",
+                        "data": {"error": "Session hooks are not properly registered"}
+                    }
+                    return
+
                 # 1. Run Planning Graph
                 async for event in planning_graph.stream_async(message):
                     transformed = transform_strands_event(event, agent_type="planning", session_id=session_id)
                     if transformed:
-                        # Accumulate metrics if this is a metrics event
-                        if transformed["type"] == "metrics":
+                        # Update model tracking if we get model information
+                        if transformed.get("type") == "metrics":
+                            model_id = transformed.get("data", {}).get("model_id", "unknown")
+                            if self._active_tracking_sessions.get(session_id) == "unknown":
+                                self._active_tracking_sessions[session_id] = model_id
+                                # Start streaming metrics tracking
+                                self.streaming_metrics_tracker.start_session_tracking(session_id, model_id)
+
+                            # Accumulate partial metrics in streaming tracker
+                            self.streaming_metrics_tracker.accumulate_partial_usage(event, session_id)
+
+                            # Accumulate metrics if this is a metrics event
                             accumulate_workflow_metrics(session_id, transformed, self, "planning")
 
                             # Also save individual message metrics to database
@@ -731,6 +1017,9 @@ class MultiAgentManager:
                                 try:
                                     db = ProjectDB(self._session_project_paths[session_id])
                                     metrics_data = transformed.get("data", {})
+
+                                    # Get current partial metrics from tracker
+                                    partial_metrics = self.streaming_metrics_tracker.get_latest_metrics(session_id)
 
                                     db.record_message_metric(
                                         session_id=session_id,
@@ -742,6 +1031,17 @@ class MultiAgentManager:
                                         prompt_tokens=metrics_data.get("input_tokens", 0),
                                         completion_tokens=metrics_data.get("output_tokens", 0)
                                     )
+
+                                    # Buffer partial metrics for recovery
+                                    if partial_metrics and not partial_metrics.is_complete:
+                                        self.metrics_buffer.add_metric(
+                                            session_id=session_id,
+                                            message_id=metrics_data.get("message_id", f"partial-{int(time.time()*1000)}"),
+                                            agent_type="planning",
+                                            metrics=partial_metrics,
+                                            is_finalized=False
+                                        )
+
                                 except Exception as e:
                                     logger.error(f"Failed to save individual message metric: {e}")
 
@@ -801,8 +1101,18 @@ Please proceed with implementation."""
                     async for event in executor_graph.stream_async(execution_message):
                         transformed = transform_strands_event(event, agent_type="execution", session_id=session_id)
                         if transformed:
-                            # Accumulate metrics if this is a metrics event
-                            if transformed["type"] == "metrics":
+                            # Update model tracking and accumulate partial metrics
+                            if transformed.get("type") == "metrics":
+                                model_id = transformed.get("data", {}).get("model_id", "unknown")
+                                if self._active_tracking_sessions.get(session_id) == "unknown":
+                                    self._active_tracking_sessions[session_id] = model_id
+                                    # Start streaming metrics tracking if not already started
+                                    self.streaming_metrics_tracker.start_session_tracking(session_id, model_id)
+
+                                # Accumulate partial metrics in streaming tracker
+                                self.streaming_metrics_tracker.accumulate_partial_usage(event, session_id)
+
+                                # Accumulate metrics if this is a metrics event
                                 accumulate_workflow_metrics(session_id, transformed, self, "execution")
 
                                 # Also save individual message metrics to database
@@ -810,6 +1120,9 @@ Please proceed with implementation."""
                                     try:
                                         db = ProjectDB(self._session_project_paths[session_id])
                                         metrics_data = transformed.get("data", {})
+
+                                        # Get current partial metrics from tracker
+                                        partial_metrics = self.streaming_metrics_tracker.get_latest_metrics(session_id)
 
                                         db.record_message_metric(
                                             session_id=session_id,
@@ -821,6 +1134,17 @@ Please proceed with implementation."""
                                             prompt_tokens=metrics_data.get("input_tokens", 0),
                                             completion_tokens=metrics_data.get("output_tokens", 0)
                                         )
+
+                                        # Buffer partial metrics for recovery
+                                        if partial_metrics and not partial_metrics.is_complete:
+                                            self.metrics_buffer.add_metric(
+                                                session_id=session_id,
+                                                message_id=metrics_data.get("message_id", f"partial-{int(time.time()*1000)}"),
+                                                agent_type="execution",
+                                                metrics=partial_metrics,
+                                                is_finalized=False
+                                            )
+
                                     except Exception as e:
                                         logger.error(f"Failed to save individual message metric: {e}")
 
@@ -905,11 +1229,48 @@ Please proceed with implementation."""
                     except Exception as e:
                         logger.error(f"Failed to emit aggregated workflow metrics: {e}")
 
+                # CRITICAL: Verify message persistence after execution
+                if not self._verify_message_persistence(session_id):
+                    logger.warning(f"Message persistence verification failed for session {session_id}. No message files were created.")
+                else:
+                    logger.info(f"Message persistence verification passed for session {session_id}")
+
             # Track session-level metrics if enabled
             self._track_metrics(session_id, project_path)
 
         except asyncio.CancelledError:
             logger.info(f"Task cancelled for session {session_id}")
+
+            # Handle cancellation with graceful metrics capture
+            try:
+                cancellation_result = self.handle_cancellation(session_id)
+
+                # Emit cancellation event with metrics information
+                yield {
+                    "type": "cancellation_handled",
+                    "data": {
+                        "session_id": session_id,
+                        "metrics_captured": cancellation_result.get("metrics_captured", False),
+                        "partial_tokens": cancellation_result.get("partial_tokens", 0),
+                        "partial_cost": cancellation_result.get("partial_cost", 0.0),
+                        "message": "Operation cancelled by user. Partial metrics have been captured for recovery."
+                    }
+                }
+
+                # Clean up tracking resources
+                self.cleanup_session_resources(session_id)
+
+            except Exception as cancel_error:
+                logger.error(f"Error during cancellation handling for session {session_id}: {cancel_error}")
+                yield {
+                    "type": "cancellation_error",
+                    "data": {
+                        "session_id": session_id,
+                        "error": str(cancel_error),
+                        "message": "Operation cancelled but metrics capture failed"
+                    }
+                }
+
             yield {"type": "error", "data": {"message": "Operation cancelled by user"}}
             raise
         except Exception as e:
@@ -918,6 +1279,28 @@ Please proceed with implementation."""
             logger.error(traceback.format_exc())
             yield {"type": "error", "data": {"message": str(e)}}
         finally:
+            # Finalize metrics tracking for successful completion
+            try:
+                if session_id in self._active_tracking_sessions:
+                    # Finalize the metrics and mark as complete
+                    final_metrics = self.streaming_metrics_tracker.finalize_metrics(session_id)
+
+                    if final_metrics and final_metrics.is_complete:
+                        # Buffer the final complete metrics
+                        self.metrics_buffer.add_metric(
+                            session_id=session_id,
+                            message_id=f"final-{int(time.time()*1000)}",
+                            agent_type="complete",
+                            metrics=final_metrics,
+                            is_finalized=True
+                        )
+
+                        logger.info(f"Finalized metrics tracking for completed session {session_id}: "
+                                 f"{final_metrics.total_tokens} tokens, ${final_metrics.cost:.6f}")
+
+            except Exception as metrics_error:
+                logger.error(f"Failed to finalize metrics for session {session_id}: {metrics_error}")
+
             # Save complete session to ProjectDB after processing
             try:
                 await self._save_assistant_response_complete(session_id)
@@ -1094,6 +1477,349 @@ Please proceed with implementation."""
                 # and the agents track their own metrics per message.
         except Exception as e:
             logger.error(f"Failed to track session metrics: {e}")
+
+    def _verify_agent_hooks(self, session_id: str) -> bool:
+        """Verify that agent hooks are properly registered and active."""
+        try:
+            graphs = self._active_graphs.get(session_id)
+            if not graphs:
+                logger.error(f"No active graphs found for session {session_id}")
+                return False
+
+            # Check that agents have active hooks
+            planning_graph = graphs.get("planning")
+            executor_graph = graphs.get("executor")
+
+            planning_hooks_active = False
+            executor_hooks_active = False
+
+            if planning_graph and planning_graph.nodes:
+                planning_node = planning_graph.nodes["planner"]
+                planning_hooks_active = (hasattr(planning_node.executor, 'hooks') and
+                                       planning_node.executor.hooks.has_callbacks())
+                logger.info(f"Planning agent hooks active: {planning_hooks_active}")
+
+            if executor_graph and executor_graph.nodes:
+                executor_node = executor_graph.nodes["executor"]
+                executor_hooks_active = (hasattr(executor_node.executor, 'hooks') and
+                                      executor_node.executor.hooks.has_callbacks())
+                logger.info(f"Executor agent hooks active: {executor_hooks_active}")
+
+            if not (planning_hooks_active and executor_hooks_active):
+                logger.error(f"Hook verification failed for session {session_id} - Planning: {planning_hooks_active}, Executor: {executor_hooks_active}")
+                return False
+
+            return True
+        except Exception as e:
+            logger.error(f"Hook verification failed: {e}")
+            return False
+
+    def _verify_message_persistence(self, session_id: str) -> bool:
+        """Verify that message files are created after agent execution."""
+        try:
+            session_path = os.path.join(self.storage_dir, f"session_{session_id}", "agents")
+
+            if not os.path.exists(session_path):
+                logger.error(f"Session agents directory not found: {session_path}")
+                return False
+
+            # Check for message files in agent directories
+            planning_messages_dir = os.path.join(session_path, "agent_planning-agent", "messages")
+            executor_messages_dir = os.path.join(session_path, "agent_executor-agent", "messages")
+
+            planning_files = []
+            executor_files = []
+
+            if os.path.exists(planning_messages_dir):
+                planning_files = [f for f in os.listdir(planning_messages_dir) if f.endswith(".json")]
+
+            if os.path.exists(executor_messages_dir):
+                executor_files = [f for f in os.listdir(executor_messages_dir) if f.endswith(".json")]
+
+            logger.info(f"Message persistence check - Planning: {len(planning_files)} files, Executor: {len(executor_files)} files")
+
+            return len(planning_files) > 0 or len(executor_files) > 0
+
+        except Exception as e:
+            logger.error(f"Message persistence verification failed: {e}")
+            return False
+
+    def _recover_metrics_callback(self, session_id: str, buffered_metric) -> bool:
+        """
+        Recovery callback for MetricsBuffer.
+
+        Attempts to recover metrics by saving them to the database.
+
+        Args:
+            session_id: The session ID
+            buffered_metric: The BufferedMetric object to recover
+
+        Returns:
+            True if recovery was successful, False otherwise
+        """
+        try:
+            if session_id in self._session_project_paths:
+                db = ProjectDB(self._session_project_paths[session_id])
+
+                # Convert PartialMetrics to database format
+                metrics = buffered_metric.metrics
+                agent_type = buffered_metric.agent_type
+
+                # Create a recovery session ID for this operation
+                recovery_session_id = f"recovery_{session_id}_{int(time.time()*1000)}"
+
+                # Save as partial metrics with recovery information
+                db.create_partial_message_metrics(
+                    session_id=session_id,
+                    message_id=buffered_metric.message_id,
+                    agent_type=agent_type,
+                    model_id=metrics.model_name,
+                    prompt_tokens=metrics.input_tokens,
+                    completion_tokens=metrics.output_tokens,
+                    total_tokens=metrics.total_tokens,
+                    estimated_cost=metrics.cost,
+                    recovery_session_id=recovery_session_id,
+                    agent_id=self._session_agent_ids.get(session_id, {}).get(agent_type, f"{agent_type}_agent")
+                )
+
+                logger.info(f"Successfully recovered metrics for session {session_id}, message {buffered_metric.message_id}")
+                return True
+
+        except Exception as e:
+            logger.error(f"Failed to recover metrics for session {session_id}: {e}")
+
+        return False
+
+    def handle_cancellation(self, session_id: str) -> Dict[str, Any]:
+        """
+        Handle session cancellation with graceful metrics capture.
+
+        This method should be called when a streaming operation is cancelled
+        to ensure partial metrics are captured and buffered for recovery.
+
+        Args:
+            session_id: The session ID being cancelled
+
+        Returns:
+            Dictionary with cancellation handling results
+        """
+        cancellation_result = {
+            "session_id": session_id,
+            "metrics_captured": False,
+            "metrics_buffered": False,
+            "partial_tokens": 0,
+            "partial_cost": 0.0,
+            "error": None
+        }
+
+        try:
+            logger.info(f"Handling cancellation for session {session_id}")
+
+            # Use the event_utils cancellation handler
+            handle_result = handle_session_cancellation(session_id, self.streaming_metrics_tracker, self.metrics_buffer)
+
+            if handle_result:
+                cancellation_result.update(handle_result)
+
+                # Get project path for database operations
+                project_path = self._session_project_paths.get(session_id)
+                if project_path:
+                    try:
+                        db = ProjectDB(project_path)
+
+                        # Update session metrics to reflect cancellation
+                        db.increment_session_cancellations(session_id)
+                        db.update_session_health(session_id, "cancelled")
+
+                        # Store partial metrics information for recovery
+                        if handle_result.get("partial_metrics"):
+                            partial_metrics = handle_result["partial_metrics"]
+
+                            # Create a recovery session ID
+                            recovery_session_id = f"recovery_{session_id}_{int(time.time()*1000)}"
+
+                            # Save partial metrics to database
+                            db.create_partial_message_metrics(
+                                session_id=session_id,
+                                message_id=f"cancelled_{int(time.time()*1000)}",
+                                agent_type="mixed",  # Could be planning or execution
+                                model_id=partial_metrics.model_name,
+                                prompt_tokens=partial_metrics.input_tokens,
+                                completion_tokens=partial_metrics.output_tokens,
+                                total_tokens=partial_metrics.total_tokens,
+                                estimated_cost=partial_metrics.cost,
+                                recovery_session_id=recovery_session_id,
+                                is_complete=False,
+                                completion_status="cancelled"
+                            )
+
+                        logger.info(f"Cancellation handled successfully for session {session_id}")
+
+                    except Exception as db_error:
+                        logger.error(f"Failed to update database for cancelled session {session_id}: {db_error}")
+                        cancellation_result["error"] = str(db_error)
+
+            else:
+                cancellation_result["error"] = "Cancellation handler returned no result"
+
+        except Exception as e:
+            logger.error(f"Error handling cancellation for session {session_id}: {e}")
+            cancellation_result["error"] = str(e)
+
+        return cancellation_result
+
+    def attempt_metrics_recovery(self, session_id: str) -> Dict[str, Any]:
+        """
+        Attempt to recover metrics for a cancelled session.
+
+        Args:
+            session_id: The session ID to recover metrics for
+
+        Returns:
+            Dictionary with recovery results
+        """
+        recovery_result = {
+            "session_id": session_id,
+            "metrics_recovered": False,
+            "recovered_count": 0,
+            "failed_count": 0,
+            "total_cost": 0.0,
+            "total_tokens": 0,
+            "error": None
+        }
+
+        try:
+            logger.info(f"Attempting metrics recovery for session {session_id}")
+
+            # Use the event_utils recovery function
+            recovery_stats = recover_session_metrics(session_id, self.metrics_buffer)
+
+            if recovery_stats:
+                recovery_result.update({
+                    "metrics_recovered": recovery_stats.get("successful", 0) > 0,
+                    "recovered_count": recovery_stats.get("successful", 0),
+                    "failed_count": recovery_stats.get("failed", 0),
+                    "total_tokens": recovery_stats.get("total_tokens", 0),
+                    "total_cost": recovery_stats.get("total_cost", 0.0)
+                })
+
+                # Update database with recovery information
+                project_path = self._session_project_paths.get(session_id)
+                if project_path and recovery_stats.get("successful", 0) > 0:
+                    try:
+                        db = ProjectDB(project_path)
+
+                        # Increment recovered operations count
+                        db.increment_recovered_operations(session_id)
+
+                        # Update session health
+                        db.update_session_health(session_id, "recovered")
+
+                        # Get and update session health report
+                        health_report = db.get_session_health_report(session_id)
+                        if health_report:
+                            logger.info(f"Session health after recovery: {health_report}")
+
+                    except Exception as db_error:
+                        logger.error(f"Failed to update database after recovery for session {session_id}: {db_error}")
+                        recovery_result["error"] = str(db_error)
+
+            else:
+                recovery_result["error"] = "No recovery stats returned"
+
+        except Exception as e:
+            logger.error(f"Error during metrics recovery for session {session_id}: {e}")
+            recovery_result["error"] = str(e)
+
+        return recovery_result
+
+    def cleanup_session_resources(self, session_id: str) -> bool:
+        """
+        Clean up all tracking resources for a session.
+
+        This should be called when a session is completely finished
+        to free up memory and clean up tracking data.
+
+        Args:
+            session_id: The session ID to clean up
+
+        Returns:
+            True if cleanup was successful, False otherwise
+        """
+        try:
+            logger.info(f"Cleaning up resources for session {session_id}")
+
+            # Stop metrics tracking
+            self.streaming_metrics_tracker.end_session_tracking(session_id)
+
+            # Clear metrics buffer for this session
+            self.metrics_buffer.clear_session(session_id, keep_recovered=True)
+
+            # Remove from active tracking sessions
+            if session_id in self._active_tracking_sessions:
+                del self._active_tracking_sessions[session_id]
+
+            # Clean up old checkpoints and stale metrics
+            self.streaming_metrics_tracker.cleanup_old_sessions()
+            self.metrics_buffer.cleanup_stale_metrics()
+
+            logger.info(f"Successfully cleaned up resources for session {session_id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error cleaning up resources for session {session_id}: {e}")
+            return False
+
+    def get_session_metrics_summary(self, session_id: str) -> Dict[str, Any]:
+        """
+        Get a comprehensive metrics summary for a session.
+
+        Args:
+            session_id: The session ID
+
+        Returns:
+            Dictionary with comprehensive metrics summary
+        """
+        try:
+            summary = {
+                "session_id": session_id,
+                "tracking_active": session_id in self._active_tracking_sessions,
+                "buffered_metrics": 0,
+                "pending_recovery": 0,
+                "streaming_stats": {},
+                "buffer_stats": {},
+                "database_health": {}
+            }
+
+            # Get streaming metrics tracker statistics
+            if session_id in self._active_tracking_sessions:
+                streaming_stats = self.streaming_metrics_tracker.get_session_statistics(session_id)
+                summary["streaming_stats"] = streaming_stats
+
+            # Get metrics buffer statistics
+            buffer_summary = self.metrics_buffer.get_buffer_summary()
+            if session_id in buffer_summary["sessions"]:
+                session_buffer_stats = buffer_summary["sessions"][session_id]
+                summary["buffered_metrics"] = session_buffer_stats["metric_count"]
+                summary["pending_recovery"] = session_buffer_stats["pending_count"]
+                summary["buffer_stats"] = session_buffer_stats
+
+            # Get database health information
+            project_path = self._session_project_paths.get(session_id)
+            if project_path:
+                try:
+                    db = ProjectDB(project_path)
+                    health_report = db.get_session_health_report(session_id)
+                    summary["database_health"] = health_report or {}
+                except Exception as e:
+                    logger.error(f"Failed to get database health for session {session_id}: {e}")
+                    summary["database_health"]["error"] = str(e)
+
+            return summary
+
+        except Exception as e:
+            logger.error(f"Error getting metrics summary for session {session_id}: {e}")
+            return {"session_id": session_id, "error": str(e)}
 
 
 # Global instance

@@ -19,11 +19,12 @@ from strands import Agent
 from strands.agent.conversation_manager import SlidingWindowConversationManager
 
 from context.engine import ContextEngine
-from .models import OpenRouterModel
-from .config import AgentConfig
-from .metrics_tracker import TokenMetricsTracker
-from .db import ProjectDB
-from .tools import (
+from core.model import GodotyOpenRouterModel
+from strands.session.file_session_manager import FileSessionManager
+from agents.config import AgentConfig
+from agents.metrics_tracker import TokenMetricsTracker
+from agents.db import ProjectDB
+from agents.tools import (
     # File system tools
     read_file,
     list_files,
@@ -68,7 +69,7 @@ from .tools import (
     play_scene,
     stop_playing,
     )
-from .tools.mcp_tools import MCPToolManager
+from agents.tools.mcp_tools import MCPToolManager
 
 logger = logging.getLogger(__name__)
 
@@ -124,19 +125,26 @@ class PlanningAgent:
 
         # Initialize OpenRouter model with metrics callback
         try:
-            self.model = OpenRouterModel(
-                api_key_value,
+            self.model = GodotyOpenRouterModel(
+                api_key=api_key_value,
                 metrics_callback=self._metrics_callback,
+                site_url=model_config.get("app_url"),
+                app_name=model_config.get("app_name"),
                 **model_config
             )
-            logger.info(f"Initialized OpenRouter model: {model_config.get('model_id')}")
+            logger.info(f"Initialized GodotyOpenRouterModel: {model_config.get('model_id')}")
         except Exception as e:
             logger.error(f"Failed to initialize model: {e}")
             # Try fallback model
             if model_config.get('model_id') != AgentConfig.FALLBACK_MODEL:
                 logger.info(f"Attempting fallback model: {AgentConfig.FALLBACK_MODEL}")
                 model_config['model_id'] = AgentConfig.FALLBACK_MODEL
-                self.model = OpenRouterModel(api_key_value, **model_config)
+                self.model = GodotyOpenRouterModel(
+                    api_key=api_key_value,
+                    site_url=model_config.get("app_url"),
+                    app_name=model_config.get("app_name"),
+                    **model_config
+                )
             else:
                 raise
 
@@ -234,7 +242,8 @@ class PlanningAgent:
             model=self.model,
             tools=self.tools,
             system_prompt=AgentConfig.PLANNING_AGENT_SYSTEM_PROMPT,
-            conversation_manager=self.conversation_manager
+            conversation_manager=self.conversation_manager,
+            agent_id="planning-agent"
         )
 
         logger.info("Planning agent initialized successfully")
@@ -250,13 +259,20 @@ class PlanningAgent:
     def _metrics_callback(self, cost: float, tokens: int, model_name: str,
                          prompt_tokens: int = 0, completion_tokens: int = 0,
                          message_id: Optional[str] = None):
-        """Callback for recording metrics from the model."""
+        """
+        Callback for recording metrics from the model.
+
+        Implements dual tracking:
+        1. ProjectDB for analytics
+        2. agent.state['godoty_metrics'] ledger for UI display
+        """
+        # Record to ProjectDB for analytics
         if self.db and self.current_session_id:
             try:
                 # Record basic session-level metric
                 self.db.record_metric(self.current_session_id, cost, tokens, model_name)
 
-                # Also record message-level metric if message_id provided
+                # Also record message_level metric if message_id provided
                 if message_id:
                     self.db.record_message_metric(
                         session_id=self.current_session_id,
@@ -269,12 +285,123 @@ class PlanningAgent:
                         completion_tokens=completion_tokens
                     )
             except Exception as e:
-                logger.error(f"Failed to record metric: {e}")
+                logger.error(f"Failed to record metric to ProjectDB: {e}")
+
+        # Maintain metrics ledger in agent state for UI display
+        try:
+            if not hasattr(self.agent, 'state'):
+                self.agent.state = {}
+
+            if 'godoty_metrics' not in self.agent.state:
+                self.agent.state['godoty_metrics'] = {
+                    'total_cost': 0.0,
+                    'total_tokens': 0,
+                    'run_history': []
+                }
+                logger.debug("Initialized godoty_metrics ledger in agent state")
+
+            ledger = self.agent.state['godoty_metrics']
+            ledger['total_cost'] += cost
+            ledger['total_tokens'] += tokens
+            ledger['run_history'].append({
+                'timestamp': datetime.utcnow().isoformat(),
+                'model': model_name,
+                'cost': cost,
+                'tokens': tokens,
+                'prompt_tokens': prompt_tokens,
+                'completion_tokens': completion_tokens
+            })
+
+            logger.debug(
+                f"Updated metrics ledger: total_cost=${ledger['total_cost']:.6f}, "
+                f"total_tokens={ledger['total_tokens']}"
+            )
+
+            # Persist to session manager
+            if hasattr(self.agent, 'session_manager') and self.current_session_id:
+                try:
+                    self.agent.session_manager.update_agent(
+                        self.current_session_id,
+                        self.agent.to_session_agent()
+                    )
+                    logger.debug(f"Persisted metrics ledger for session {self.current_session_id}")
+                except Exception as e:
+                    logger.error(f"Failed to persist ledger to session manager: {e}")
+        except Exception as e:
+            logger.error(f"Failed to update metrics ledger: {e}", exc_info=True)
+
+    def get_session_metrics(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Retrieve metrics ledger for displaying session totals.
+
+        Args:
+            session_id: Optional session ID to load metrics from.
+                       If not provided, uses current session's agent state.
+
+        Returns:
+            Dictionary containing total_cost, total_tokens, and run_history
+        """
+        # If session_id provided and different from current, load from FileSessionManager
+        if session_id and session_id != self.current_session_id:
+            try:
+                session_manager = FileSessionManager(session_id=session_id)
+                session_data = session_manager.read_agent(session_id)
+                return session_data.state.get('godoty_metrics', {
+                    'total_cost': 0.0,
+                    'total_tokens': 0,
+                    'run_history': []
+                })
+            except Exception as e:
+                logger.error(f"Failed to load metrics for session {session_id}: {e}")
+                return {
+                    'total_cost': 0.0,
+                    'total_tokens': 0,
+                    'run_history': []
+                }
+
+        # Use current agent state
+        if hasattr(self.agent, 'state'):
+            return self.agent.state.get('godoty_metrics', {
+                'total_cost': 0.0,
+                'total_tokens': 0,
+                'run_history': []
+            })
+
+        return {
+            'total_cost': 0.0,
+            'total_tokens': 0,
+            'run_history': []
+        }
 
     def start_session(self, session_id: str):
-        """Start tracking a session for metrics."""
+        """Start tracking a session for metrics and persistence."""
         self.current_session_id = session_id
         logger.info(f"Planning agent started tracking session: {session_id}")
+        
+        # Re-initialize agent with FileSessionManager for this session
+        try:
+            session_manager = FileSessionManager(session_id=session_id)
+            
+            # Recreate the agent with the session manager
+            self.agent = Agent(
+                model=self.model,
+                tools=self.tools,
+                system_prompt=AgentConfig.PLANNING_AGENT_SYSTEM_PROMPT,
+                conversation_manager=self.conversation_manager,
+                session_manager=session_manager,
+                agent_id="planning-agent"
+            )
+            
+            # Load previous metrics if available
+            if hasattr(self.agent, 'state'):
+                metrics_state = self.agent.state.get("godoty_metrics", {})
+                if metrics_state:
+                    logger.info(f"Resumed session {session_id}. Previous cost: ${metrics_state.get('total_cost', 0):.4f}")
+                    
+        except Exception as e:
+            logger.error(f"Failed to initialize session manager for {session_id}: {e}")
+            # Fallback to default agent if session manager fails
+
 
     def _initialize_mcp_tools_sync(self):
         """
@@ -338,7 +465,8 @@ class PlanningAgent:
                             model=self.model,
                             tools=self.tools,
                             system_prompt=AgentConfig.PLANNING_AGENT_SYSTEM_PROMPT,
-                            conversation_manager=self.conversation_manager
+                            conversation_manager=self.conversation_manager,
+                            agent_id="planning-agent"
                         )
 
                         connected_servers = self.mcp_manager.get_connected_servers()
@@ -374,7 +502,8 @@ class PlanningAgent:
                 model=self.model,
                 tools=self.tools,
                 system_prompt=enhanced_prompt,
-                conversation_manager=self.conversation_manager
+                conversation_manager=self.conversation_manager,
+                agent_id="planning-agent"
             )
             # logger.info("Agent context updated with dynamic codebase map")
             
@@ -542,7 +671,7 @@ class PlanningAgent:
             logger.info(f"[PLAN] Starting Strands Agent Loop for prompt: {prompt[:100]}...")
 
             # Import shared event utility
-            from .event_utils import transform_strands_event
+            from agents.event_utils import transform_strands_event
 
             # Use the Strands Agent's stream_async method to get streaming events
             # This will trigger the full agent loop with tool execution
@@ -583,7 +712,8 @@ class PlanningAgent:
             model=self.model,
             tools=self.tools,
             system_prompt=AgentConfig.PLANNING_AGENT_SYSTEM_PROMPT,
-            conversation_manager=self.conversation_manager
+            conversation_manager=self.conversation_manager,
+            agent_id="planning-agent"
         )
         logger.info("Conversation history reset")
 

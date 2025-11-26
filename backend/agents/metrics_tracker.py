@@ -14,68 +14,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
-class ModelPricing:
-    """
-    Model pricing information for cost calculation.
-    
-    Prices are in USD per 1M tokens.
-    Source: OpenRouter pricing (should be updated periodically)
-    """
-    
-    # Pricing table: model_id -> (prompt_price_per_1m, completion_price_per_1m)
-    PRICING = {
-        "openai/gpt-4-turbo": (10.0, 30.0),
-        "openai/gpt-4": (30.0, 60.0),
-        "openai/gpt-3.5-turbo": (0.5, 1.5),
-        "anthropic/claude-3.5-sonnet": (3.0, 15.0),
-        "anthropic/claude-3-opus": (15.0, 75.0),
-        "anthropic/claude-3-sonnet": (3.0, 15.0),
-        "anthropic/claude-3-haiku": (0.25, 1.25),
-        "google/gemini-pro": (0.5, 1.5),
-        "meta-llama/llama-3-70b-instruct": (0.9, 0.9),
-        "openrouter/sherlock-dash-alpha": (0.1, 0.1),  # Estimated
-        "minimax/minimax-m2": (0.5, 0.5),  # Estimated
-    }
-    
-    DEFAULT_PRICING = (1.0, 2.0)  # Default if model not found
-    
-    @classmethod
-    def get_pricing(cls, model_id: str) -> Tuple[float, float]:
-        """
-        Get pricing for a model.
-        
-        Args:
-            model_id: Model identifier
-            
-        Returns:
-            Tuple of (prompt_price_per_1m, completion_price_per_1m)
-        """
-        return cls.PRICING.get(model_id, cls.DEFAULT_PRICING)
-    
-    @classmethod
-    def calculate_cost(
-        cls,
-        model_id: str,
-        prompt_tokens: int,
-        completion_tokens: int
-    ) -> float:
-        """
-        Calculate estimated cost for token usage.
-        
-        Args:
-            model_id: Model identifier
-            prompt_tokens: Number of prompt tokens
-            completion_tokens: Number of completion tokens
-            
-        Returns:
-            Estimated cost in USD
-        """
-        prompt_price, completion_price = cls.get_pricing(model_id)
-        
-        prompt_cost = (prompt_tokens / 1_000_000) * prompt_price
-        completion_cost = (completion_tokens / 1_000_000) * completion_price
-        
-        return prompt_cost + completion_cost
+from core.pricing import PricingService
 
 
 class TokenMetricsTracker:
@@ -130,7 +69,7 @@ class TokenMetricsTracker:
             estimated_cost = float(actual_cost)
         else:
             # Calculate estimated cost
-            estimated_cost = ModelPricing.calculate_cost(
+            estimated_cost = PricingService.calculate_cost(
                 model_id,
                 prompt_tokens,
                 completion_tokens
@@ -183,18 +122,24 @@ class TokenMetricsTracker:
                     prompt_tokens = accumulated_usage.get('inputTokens', 0)
                     completion_tokens = accumulated_usage.get('outputTokens', 0)
                     total_tokens = accumulated_usage.get('totalTokens', 0)
-                    
-                    # Check for cost in accumulated_usage
-                    actual_cost = accumulated_usage.get('cost')
-                    
+
+                    # Cost precedence: actual_cost (from OpenRouter) > godoty_cost (calculated) > PricingService fallback
+                    actual_cost = accumulated_usage.get('actual_cost')  # From OpenRouter
+                    godoty_cost = accumulated_usage.get('godoty_cost')  # From GodotyOpenRouterModel
+
                     if actual_cost is not None:
                         estimated_cost = float(actual_cost)
+                        logger.debug("Using actual_cost from OpenRouter")
+                    elif godoty_cost is not None:
+                        estimated_cost = float(godoty_cost)
+                        logger.debug("Using godoty_cost from calculation")
                     else:
-                        estimated_cost = ModelPricing.calculate_cost(
+                        estimated_cost = PricingService.calculate_cost(
                             model_id,
                             prompt_tokens,
                             completion_tokens
                         )
+                        logger.debug("Fallback to PricingService calculation")
                     
                     return {
                         "prompt_tokens": prompt_tokens,
@@ -210,18 +155,24 @@ class TokenMetricsTracker:
                 prompt_tokens = usage.get('prompt_tokens', 0)
                 completion_tokens = usage.get('completion_tokens', 0)
                 total_tokens = usage.get('total_tokens', 0)
-                
-                # Check for cost in usage
-                actual_cost = usage.get('cost')
-                
+
+                # Cost precedence: actual_cost (from OpenRouter) > godoty_cost (calculated) > PricingService fallback
+                actual_cost = usage.get('actual_cost')  # From OpenRouter
+                godoty_cost = usage.get('godoty_cost')  # From GodotyOpenRouterModel
+
                 if actual_cost is not None:
                     estimated_cost = float(actual_cost)
+                    logger.debug("Using actual_cost from OpenRouter")
+                elif godoty_cost is not None:
+                    estimated_cost = float(godoty_cost)
+                    logger.debug("Using godoty_cost from calculation")
                 else:
-                    estimated_cost = ModelPricing.calculate_cost(
+                    estimated_cost = PricingService.calculate_cost(
                         model_id,
                         prompt_tokens,
                         completion_tokens
                     )
+                    logger.debug("Fallback to PricingService calculation")
                 
                 return {
                     "prompt_tokens": prompt_tokens,
@@ -263,13 +214,14 @@ class TokenMetricsTracker:
                 completion_tokens = usage.get("outputTokens", 0)
                 total_tokens = usage.get("totalTokens", 0)
                 
-                # Check for cost in usage
-                actual_cost = usage.get("cost")
-                
-                if actual_cost is not None:
+                # Check for godoty_cost
+                godoty_cost = usage.get("godoty_cost")
+                if godoty_cost is not None:
+                    estimated_cost = float(godoty_cost)
+                elif actual_cost is not None:
                     estimated_cost = float(actual_cost)
                 else:
-                    estimated_cost = ModelPricing.calculate_cost(
+                    estimated_cost = PricingService.calculate_cost(
                         model_id,
                         prompt_tokens,
                         completion_tokens

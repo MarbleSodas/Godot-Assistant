@@ -1,5 +1,8 @@
-"""Custom model providers for Strands Agents."""
+"""
+Custom model providers for Strands Agents.
 
-from .openrouter import OpenRouterModel
+Note: OpenRouterModel has been deprecated and removed.
+Use GodotyOpenRouterModel from backend.core.model instead.
+"""
 
-__all__ = ["OpenRouterModel"]
+__all__ = []

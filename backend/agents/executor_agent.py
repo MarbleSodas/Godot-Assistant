@@ -10,6 +10,7 @@ import warnings
 import uuid
 import asyncio
 import os
+from datetime import datetime
 from typing import Optional, AsyncIterable, Dict, Any, List
 
 # Suppress LangGraph warning
@@ -17,13 +18,14 @@ warnings.filterwarnings("ignore", message="Graph without execution limits may ru
 
 from strands import Agent
 from strands.agent.conversation_manager import SlidingWindowConversationManager
+from strands.session.file_session_manager import FileSessionManager
 
 from context.engine import ContextEngine
-from .db import ProjectDB
-from .models import OpenRouterModel
-from .config import AgentConfig
-from .metrics_tracker import TokenMetricsTracker
-from .tools import (
+from agents.db import ProjectDB
+from core.model import GodotyOpenRouterModel
+from agents.config import AgentConfig
+from agents.metrics_tracker import TokenMetricsTracker
+from agents.tools import (
     # Godot control tools
     open_scene,
     play_scene,
@@ -57,7 +59,7 @@ from .tools import (
     search_codebase,
 )
 # Import ExecutionPlan for compatibility if needed, though we are moving to LLM-driven execution
-from .execution_models import ExecutionPlan, StreamEvent
+from agents.execution_models import ExecutionPlan, StreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -113,21 +115,29 @@ class ExecutorAgent:
         # Merge additional config
         model_config.update(kwargs)
 
-        # Initialize OpenRouter model
+        # Initialize GodotyOpenRouterModel with direct OpenRouter integration
         try:
-            self.model = OpenRouterModel(
-                api_key_value, 
-                metrics_callback=self._metrics_callback,
-                **model_config
+            self.model = GodotyOpenRouterModel(
+                api_key=api_key_value,
+                model_id=model_config["model_id"],
+                site_url=model_config.get("app_url"),
+                app_name=model_config.get("app_name"),
+                metrics_callback=self._metrics_callback
             )
-            logger.info(f"Initialized Executor model: {model_config.get('model_id')}")
+            logger.info(f"Initialized GodotyOpenRouterModel for executor: {model_config.get('model_id')}")
         except Exception as e:
             logger.error(f"Failed to initialize executor model: {e}")
             # Try fallback model
             if AgentConfig.EXECUTOR_FALLBACK_MODEL:
                 logger.info(f"Attempting fallback executor model: {AgentConfig.EXECUTOR_FALLBACK_MODEL}")
                 model_config['model_id'] = AgentConfig.EXECUTOR_FALLBACK_MODEL
-                self.model = OpenRouterModel(api_key_value, **model_config)
+                self.model = GodotyOpenRouterModel(
+                    api_key=api_key_value,
+                    model_id=model_config['model_id'],
+                    site_url=model_config.get("app_url"),
+                    app_name=model_config.get("app_name"),
+                    metrics_callback=self._metrics_callback
+                )
             else:
                 raise
 
@@ -185,7 +195,8 @@ class ExecutorAgent:
             model=self.model,
             tools=self.tools,
             system_prompt=AgentConfig.EXECUTOR_AGENT_SYSTEM_PROMPT,
-            conversation_manager=self.conversation_manager
+            conversation_manager=self.conversation_manager,
+            agent_id="executor-agent"
         )
 
         # Initialize agent state for context persistence
@@ -204,7 +215,14 @@ class ExecutorAgent:
     def _metrics_callback(self, cost: float, tokens: int, model_name: str,
                          prompt_tokens: int = 0, completion_tokens: int = 0,
                          message_id: Optional[str] = None):
-        """Callback for recording metrics from the model."""
+        """
+        Callback for recording metrics from the model.
+
+        Implements dual tracking:
+        1. ProjectDB for analytics
+        2. agent.state['godoty_metrics'] ledger for UI display
+        """
+        # Record to ProjectDB for analytics
         if self.db and self.current_session_id:
             try:
                 # Record basic session-level metric
@@ -223,7 +241,93 @@ class ExecutorAgent:
                         completion_tokens=completion_tokens
                     )
             except Exception as e:
-                logger.error(f"Failed to record metric: {e}")
+                logger.error(f"Failed to record metric to ProjectDB: {e}")
+
+        # Maintain metrics ledger in agent state for UI display
+        try:
+            if not hasattr(self.agent, 'state'):
+                self.agent.state = {}
+
+            if 'godoty_metrics' not in self.agent.state:
+                self.agent.state['godoty_metrics'] = {
+                    'total_cost': 0.0,
+                    'total_tokens': 0,
+                    'run_history': []
+                }
+                logger.debug("Initialized godoty_metrics ledger in agent state")
+
+            ledger = self.agent.state['godoty_metrics']
+            ledger['total_cost'] += cost
+            ledger['total_tokens'] += tokens
+            ledger['run_history'].append({
+                'timestamp': datetime.utcnow().isoformat(),
+                'model': model_name,
+                'cost': cost,
+                'tokens': tokens,
+                'prompt_tokens': prompt_tokens,
+                'completion_tokens': completion_tokens
+            })
+
+            logger.debug(
+                f"Updated metrics ledger: total_cost=${ledger['total_cost']:.6f}, "
+                f"total_tokens={ledger['total_tokens']}"
+            )
+
+            # Persist to session manager
+            if hasattr(self.agent, 'session_manager') and self.current_session_id:
+                try:
+                    self.agent.session_manager.update_agent(
+                        self.current_session_id,
+                        self.agent.to_session_agent()
+                    )
+                    logger.debug(f"Persisted metrics ledger for session {self.current_session_id}")
+                except Exception as e:
+                    logger.error(f"Failed to persist ledger to session manager: {e}")
+        except Exception as e:
+            logger.error(f"Failed to update metrics ledger: {e}", exc_info=True)
+
+    def get_session_metrics(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Retrieve metrics ledger for displaying session totals.
+
+        Args:
+            session_id: Optional session ID to load metrics from.
+                       If not provided, uses current session's agent state.
+
+        Returns:
+            Dictionary containing total_cost, total_tokens, and run_history
+        """
+        # If session_id provided and different from current, load from FileSessionManager
+        if session_id and session_id != self.current_session_id:
+            try:
+                session_manager = FileSessionManager(session_id=session_id)
+                session_data = session_manager.read_agent(session_id)
+                return session_data.state.get('godoty_metrics', {
+                    'total_cost': 0.0,
+                    'total_tokens': 0,
+                    'run_history': []
+                })
+            except Exception as e:
+                logger.error(f"Failed to load metrics for session {session_id}: {e}")
+                return {
+                    'total_cost': 0.0,
+                    'total_tokens': 0,
+                    'run_history': []
+                }
+
+        # Use current agent state
+        if hasattr(self.agent, 'state'):
+            return self.agent.state.get('godoty_metrics', {
+                'total_cost': 0.0,
+                'total_tokens': 0,
+                'run_history': []
+            })
+
+        return {
+            'total_cost': 0.0,
+            'total_tokens': 0,
+            'run_history': []
+        }
 
     def start_session(self, session_id: Optional[str] = None):
         """Start a new session or continue an existing one."""
@@ -255,13 +359,40 @@ class ExecutorAgent:
         # Here we attempt to restore if compatible methods exist
         
         try:
-            history = session_data.get("chat_history", [])
+            # ProjectDB only stores metadata, use FileSessionManager for chat history
+            session_manager = FileSessionManager(
+                session_id=session_id,
+                storage_dir=self.config.get("storage_dir", ".godoty_sessions")
+            )
+
+            # Discover agent IDs from directory structure
+            session_dir = os.path.join(session_manager.storage_dir, f"session_{session_id}")
+            agents_dir = os.path.join(session_dir, "agents")
+
+            history = []
+            if os.path.exists(agents_dir):
+                agent_ids = [d.replace("agent_", "") for d in os.listdir(agents_dir)
+                            if d.startswith("agent_")]
+
+                # Collect messages from all agents
+                for agent_id in agent_ids:
+                    try:
+                        messages = session_manager.list_messages(
+                            session_id=session_id,
+                            agent_id=agent_id,
+                            offset=0,
+                            limit=1000
+                        )
+                        history.extend(messages)
+                    except Exception as e:
+                        logger.warning(f"Failed to load messages for agent {agent_id}: {e}")
+
             # Clear current history if needed?
-            # self.conversation_manager.history.clear() 
-            
+            # self.conversation_manager.history.clear()
+
             for msg in history:
                 # Adapt message format if needed
-                role = msg.get("role")
+                role = getattr(msg, "role", None) or msg.get("role") if isinstance(msg, dict) else None
                 content = msg.get("content")
                 if role and content:
                     self.conversation_manager.add_message(
@@ -312,7 +443,8 @@ class ExecutorAgent:
                 model=self.model,
                 tools=self.tools,
                 system_prompt=enhanced_prompt,
-                conversation_manager=self.conversation_manager
+                conversation_manager=self.conversation_manager,
+                agent_id="executor-agent"
             )
             # Restore state references that might be lost on recreation if Agent class doesn't persist them automatically
             # (Assuming Agent class handles this or we rely on conversation_manager)
@@ -501,7 +633,7 @@ class ExecutorAgent:
                                  "content": content
                              })
                     
-                    self.db.save_session(self.current_session_id, serialized_history)
+                    self.db.save_session(self.current_session_id)
                     logger.info(f"Saved session {self.current_session_id}")
                 except Exception as e:
                     logger.error(f"Failed to save session history: {e}")
